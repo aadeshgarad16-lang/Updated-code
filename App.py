@@ -45,13 +45,17 @@ app.json = CustomJSONProvider(app)
 # =====================================================================
 # STAGE NORMALIZATION ARCHITECTURE
 # =====================================================================
-VALID_ORDER_STAGES = ['Initiation', 'Inventory Check', 'Procurement', 'Quality & Packing', 'Dispatched']
+VALID_ORDER_STAGES = [
+    'Initiation', 'Order Initiation', 'Specifications', 'Order Specifications', 
+    'Stock Check', 'BOM Calculation', 'Inventory Check', 'Material Allocation', 
+    'Procurement', 'Material Release', 'Production', 'Quality & Packing', 'Dispatched'
+]
 STAGE_MAP = {stage.lower(): stage for stage in VALID_ORDER_STAGES}
 
-def normalize_stage(raw_stage, default='Initiation'):
+def normalize_stage(raw_stage, default='Specifications'):
     """
     Sanitizes, trims, and normalizes the stage string against strict ENUM boundaries.
-    Defaults to 'Initiation' if invalid or empty.
+    Defaults to 'Specifications' if invalid or empty.
     """
     if not raw_stage:
         return default
@@ -590,6 +594,59 @@ def add_customer():
     except Exception as e:
         return jsonify({"success": False, "error": f"Database insertion error: {str(e)}"}), 500
 
+@app.route('/api/customers/validate_address', methods=['POST'])
+def validate_customer_address():
+    if not verify_read_key('Order Initiation') and not verify_read_key('Sales'): 
+        return "Unauthorized", 401
+    
+    data = request.json
+    address = data.get('address')
+    pin = data.get('pin_code')
+    
+    if not address or not pin:
+        return jsonify({"exists": False, "error": "Address and pin code required"}), 400
+        
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT customer_name FROM customers WHERE delivery_address = %s AND pin_code = %s", (address, pin))
+    match = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if match:
+        return jsonify({"exists": True, "data": match})
+    return jsonify({"exists": False})
+
+@app.route('/api/customers/update_address', methods=['POST'])
+def update_customer_address():
+    if not verify_write_key('Order Initiation') and not verify_write_key('Sales'): 
+        return "Unauthorized", 401
+    
+    data = request.json
+    customer_name = data.get('customer_name')
+    address = data.get('address')
+    pin_code = data.get('pin_code')
+    
+    if not customer_name:
+        return jsonify({"success": False, "error": "customer_name is required"}), 400
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Update both fields as a single transaction block
+        cursor.execute(
+            "UPDATE customers SET delivery_address = %s, pin_code = %s WHERE customer_name = %s",
+            (address, pin_code, customer_name)
+        )
+        conn.commit()
+        return jsonify({"success": True, "message": "Address updated successfully"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
 
 # =====================================================================
 # MODULE 2: PURCHASE ORDERS
@@ -764,6 +821,15 @@ def get_purchase_order_details(po_number):
             # Explicitly separate physical count from financial totals for the frontend
             spec['required_qty'] = spec['quantity']
             spec['total_cost_value'] = po_data.get('total_value', 0.0)
+            
+            desc_str = str(spec.get('item_description') or '').lower()
+            name_str = str(spec.get('garment_name') or '').lower()
+            cat_str = str(spec.get('category') or '').lower()
+            
+            if ('uniform' in desc_str or 'uniform' in name_str) and cat_str in ['shirt', 'pant']:
+                spec['is_uniform'] = True
+            else:
+                spec['is_uniform'] = False
         
         po_data["specs"] = specs
         
@@ -918,17 +984,17 @@ def add_purchase_order():
         # New delivery_date logic
         del_date = clean_mysql_date(data.get('deliveryDate') or data.get('delivery_date'))
         
-        c_person = data.get('contactPerson') or data.get('contact_person') or data.get('contact_name')
-        c_phone = data.get('contactPhone') or data.get('contact_phone')
-        c_email = data.get('contactEmail') or data.get('contact_email')
-        d_type = data.get('deliveryType') or data.get('delivery_type')
-        d_addr = data.get('deliveryAddress') or data.get('delivery_address')
-        d_pin = data.get('deliveryPin') or data.get('delivery_pin')
-        b_comp = data.get('billTo') or data.get('billing_company')
-        b_addr = data.get('billingAddress') or data.get('billing_address')
-        b_pin = data.get('billingPin') or data.get('billing_pin')
-        gst = data.get('gstNo') or data.get('gst_number') or data.get('gst_no')
-        cin = data.get('cinNo') or data.get('cin_number') or data.get('cin_no')
+        c_person = data.get('contactPerson') or data.get('contact_person') or data.get('contact_name') or ''
+        c_phone = data.get('contactPhone') or data.get('contact_phone') or ''
+        c_email = data.get('contactEmail') or data.get('contact_email') or ''
+        d_type = data.get('deliveryType') or data.get('delivery_type') or ''
+        d_addr = data.get('deliveryAddress') or data.get('delivery_address') or ''
+        d_pin = data.get('deliveryPin') or data.get('delivery_pin') or ''
+        b_comp = data.get('billTo') or data.get('billing_company') or ''
+        b_addr = data.get('billingAddress') or data.get('billing_address') or ''
+        b_pin = data.get('billingPin') or data.get('billing_pin') or ''
+        gst = data.get('gstNo') or data.get('gst_number') or data.get('gst_no') or ''
+        cin = data.get('cinNo') or data.get('cin_number') or data.get('cin_no') or ''
         tc = data.get('testCertificate') or data.get('test_certificate')
         t_cost = data.get('transportCost') or data.get('transport_cost')
         adv = data.get('advancedAmount') or data.get('advance_amount') or 0
@@ -939,7 +1005,7 @@ def add_purchase_order():
             cursor.execute(
                 """
                 UPDATE purchase_orders SET 
-                customer_id=%s, status=%s, total_value=%s, order_date=%s, delivery_date=%s, contact_person=%s, contact_phone=%s, contact_email=%s, delivery_type=%s, delivery_address=%s, delivery_pin=%s, billing_company=%s, billing_address=%s, billing_pin=%s, gst_number=%s, cin_number=%s, test_certificate=%s, transport_cost=%s, advance_amount=%s, stage=%s 
+                customer_id=%s, status=%s, total_value=%s, order_date=%s, delivery_date=%s, contact_person=%s, contact_phone=%s, contact_email=%s, delivery_type=%s, delivery_address=%s, delivery_pin=%s, billing_company=%s, billing_address=%s, billing_pin=%s, gst_number=%s, cin_number=%s, test_certificate=%s, transport_cost=%s, advance_amount=%s, stage=%s, payment_term=%s 
                 WHERE po_number=%s
                 """,
                 (final_customer_id, status, tot_val, o_date, del_date, c_person, c_phone, c_email, d_type, d_addr, d_pin, b_comp, b_addr, b_pin, gst, cin, tc, t_cost, adv, stg, pt, po_num)
@@ -953,7 +1019,13 @@ def add_purchase_order():
                 (po_num, final_customer_id, status, tot_val, o_date, del_date, c_person, c_phone, c_email, d_type, d_addr, d_pin, b_comp, b_addr, b_pin, gst, cin, tc, t_cost, adv, stg, pt)
             )
         conn.commit()
-        return jsonify({"success": True, "message": "Purchase Order updated successfully"}), 201
+
+        # Fetch the complete freshly generated order object
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM purchase_orders WHERE po_number = %s", (po_num,))
+        order_record = cursor.fetchone()
+
+        return jsonify({"success": True, "message": "Purchase Order updated successfully", "data": order_record}), 201
     except Exception as e:
         if conn:
             conn.rollback()
@@ -1915,12 +1987,16 @@ def save_po_specifications():
         # Process the specifications loop for database persistence
         if specs and isinstance(specs, list):
             for spec in specs:
-                sku = spec.get('sku_no') or spec.get('item_description')
-                if not sku or sku == 'UNKNOWN_SKU':
-                    continue
+                sku_raw = spec.get('sku_no') or spec.get('item_description') or ''
+                sku = str(sku_raw).strip()
                 
                 # Extract quantities safely
                 req_qty = float(spec.get('required_qty') or spec.get('requiredQty') or spec.get('quantity') or 0)
+                
+                # Filter out entirely empty/untouched specification default rows
+                if (not sku or sku == 'UNKNOWN_SKU') and req_qty == 0:
+                    continue
+                    
                 avail_qty = float(spec.get('available_qty') or spec.get('availableQty') or spec.get('stock_available') or 0)
                 use_existing_stock = int(spec.get('useExistingStock') or spec.get('use_existing_stock') or 0)
                 
@@ -2485,10 +2561,51 @@ def get_check_stock():
         sku_no = spec['item_description'] if spec and spec.get('item_description') else "UNKNOWN_SKU"
         
         # 3. Match against pre_stitched_inventory (mapped to store_garments)
-        cursor.execute("SELECT garment_id, available_qty FROM store_garments WHERE sku_no = %s AND is_deleted = 0", (sku_no,))
+        cursor.execute("SELECT garment_id, available_qty, category FROM store_garments WHERE sku_no = %s AND is_deleted = 0", (sku_no,))
         garment = cursor.fetchone()
         
         available_qty = float(garment['available_qty']) if garment and garment.get('available_qty') else 0.0
+        
+        # --- DYNAMIC WORKFLOW BUTTON LOGIC ---
+        routing_action = "PURCHASE_REQUEST"
+        payload_available_qty = 0
+        payload_purchase_qty = 0
+        
+        is_shirt_or_pant = False
+        if 'shirt' in sku_no.lower() or 'pant' in sku_no.lower():
+            is_shirt_or_pant = True
+        if garment and garment.get('category') and ('shirt' in garment['category'].lower() or 'pant' in garment['category'].lower()):
+            is_shirt_or_pant = True
+            
+        is_uniform = 'uniform' in sku_no.lower()
+
+        if is_shirt_or_pant and is_uniform:
+            # Permanent bypass: directly target manufacturing breakdown
+            cursor.execute("UPDATE purchase_orders SET stage = 'BOM Calculation' WHERE po_number = %s", (po_number,))
+            conn.commit()
+            
+            return jsonify({
+                "success": True,
+                "has_shortage": True,
+                "shortage_qty": required_qty,
+                "next_step": "bom_calculation",
+                "message": "Uniform detected. Routed directly to BOM Calculation.",
+                "routingAction": "BOM_CALCULATION",
+                "status": "Out of Stock",
+                "isUniform": True,
+                "availableQty": 0,
+                "purchaseRequestQty": 0
+            }), 200
+
+        if available_qty >= required_qty:
+            routing_action = "QUALITY_PACKING"
+        elif available_qty > 0 and available_qty < required_qty:
+            routing_action = "PARTIAL_SPLIT"
+            payload_available_qty = available_qty
+            payload_purchase_qty = required_qty - available_qty
+        elif available_qty == 0:
+            routing_action = "PURCHASE_REQUEST"
+        # -------------------------------------
         
         # 4. CONDITIONAL WORKFLOW ROUTING ENGINE
         if available_qty >= required_qty:
@@ -2503,7 +2620,9 @@ def get_check_stock():
                 "success": True,
                 "has_shortage": False,
                 "next_step": "quality_packing",
-                "message": "100% fulfillment capability. Routed to Quality & Packing."
+                "message": "100% fulfillment capability. Routed to Quality & Packing.",
+                "routingAction": routing_action,
+                "isUniform": is_uniform
             }), 200
             
         else:
@@ -2525,7 +2644,11 @@ def get_check_stock():
                 "has_shortage": True,
                 "shortage_qty": shortage_qty,
                 "next_step": "bom_calculation",
-                "message": f"Shortage detected ({shortage_qty} units). Routed to BOM Calculation."
+                "message": f"Shortage detected ({shortage_qty} units). Routed to BOM Calculation.",
+                "routingAction": routing_action,
+                "availableQty": payload_available_qty,
+                "purchaseRequestQty": payload_purchase_qty,
+                "isUniform": is_uniform
             }), 200
             
     except Exception as e:
@@ -3436,13 +3559,13 @@ def get_orders_report():
             status = order.get('status') or ''
             
             # Compute counts for the 4 report summary metrics
-            if stage in ['Order Initiation', 'Specifications', 'Stock Check', 'BOM Calculation'] or status == 'Pending':
+            if stage in ['Initiation', 'Order Initiation', 'Specifications', 'Order Specifications', 'Stock Check', 'BOM Calculation'] or status == 'Pending':
                 stats['pending'] += 1
-            elif stage in ['Inventory Check', 'Material Allocation', 'Material Release', 'Production', 'Quality & Packing'] or status == 'In Progress':
+            elif stage in ['Inventory Check', 'Material Allocation', 'Procurement', 'Material Release', 'Production', 'Quality & Packing'] or status == 'In Progress':
                 stats['inProduction'] += 1
             elif stage == 'Cutting':
                 stats['cutting'] += 1
-            elif status == 'Delivered':
+            elif stage == 'Dispatched' or status == 'Delivered':
                 stats['delivered'] += 1
                 
             # Shape table row keys

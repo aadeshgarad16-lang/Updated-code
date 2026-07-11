@@ -4,9 +4,9 @@ from Main import get_db_connection
 conn = get_db_connection()
 cursor = conn.cursor()
 try:
-    cursor.execute("ALTER TABLE customers ADD COLUMN delivery_address TEXT, ADD COLUMN pin_code VARCHAR(20);")
-    conn.commit()
-    print("Columns added successfully")
+    cursor.execute("SHOW CREATE TABLE purchase_orders;")
+    rows = cursor.fetchone()
+    print("Schema:", rows[1])
 except Exception as e:
     print(f"Error: {e}")
 cursor.close()
