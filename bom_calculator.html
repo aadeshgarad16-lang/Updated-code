@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic BOM Calculator - React UI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --glass-bg: rgba(30, 41, 59, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.1);
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --accent: #8b5cf6;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --danger: #ef4444;
+            --success: #10b981;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Outfit', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(139, 92, 246, 0.15) 0px, transparent 50%);
+            background-attachment: fixed;
+            padding: 3rem 1rem;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+        }
+
+        .glass-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 2.5rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            border-bottom: 1px solid var(--glass-border);
+            padding-bottom: 1.5rem;
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            font-weight: 600;
+            background: linear-gradient(to right, #fff, #94a3b8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* Top Controls */
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+            align-items: flex-end;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .form-group label {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        select, input {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid var(--glass-border);
+            color: var(--text-main);
+            padding: 0.8rem 1rem;
+            border-radius: 12px;
+            font-size: 1rem;
+            outline: none;
+            transition: all 0.3s ease;
+            appearance: none;
+        }
+        
+        select {
+            cursor: pointer;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/200.svg' width='16' height='16' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1rem center;
+            padding-right: 2.5rem;
+        }
+
+        select:focus, input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+        }
+
+        select:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Material List */
+        .materials-container {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            margin-top: 2rem;
+            animation: fadeIn 0.4s ease forwards;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .material-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 1.5rem;
+            border-radius: 16px;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1.5rem;
+            transition: all 0.3s ease;
+        }
+
+        .material-card:hover {
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(255, 255, 255, 0.15);
+            transform: scale(1.01);
+        }
+
+        .material-info {
+            flex: 1;
+            min-width: 250px;
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .material-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .material-qty-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .material-qty {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--success);
+        }
+
+        .material-unit {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .material-controls {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .material-controls .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+        }
+        
+        .material-controls label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .material-controls select {
+            padding: 0.6rem 1rem;
+            font-size: 0.9rem;
+            min-width: 140px;
+        }
+
+        /* Loading & Error States */
+        .loader-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 3rem;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid rgba(255,255,255,0.1);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        .card-spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255,255,255,0.1);
+            border-top-color: var(--success);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .alert {
+            padding: 1rem;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
+        }
+        
+        .empty-state {
+            padding: 3rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-style: italic;
+            border: 1px dashed var(--glass-border);
+            border-radius: 12px;
+            margin-top: 1rem;
+        }
+
+        @media (max-width: 768px) {
+            .controls {
+                grid-template-columns: 1fr;
+            }
+            .material-controls {
+                width: 100%;
+            }
+            .material-controls .control-group {
+                flex: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // Configuration
+        const sizeMapping = {
+            'Shirt': ['38', '40', '42', '44'],
+            'Pant': ['28', '30', '32', '34', '36', '38'],
+            'T-Shirt': ['S', 'M', 'L', 'XL', 'XXL'],
+            'Jacket': ['M', 'L', 'XL', 'XXL']
+        };
+
+        const mapDatabaseToMaterials = (dbData) => [
+            {
+                id: 'fabric',
+                name: 'Cotton Fabric (Premium)',
+                unit: 'meters',
+                quantity: dbData.fabric_full_sleeve || dbData.fabric || 0,
+            },
+            {
+                id: 'thread',
+                name: 'Standard Thread (White)',
+                unit: 'spools',
+                quantity: dbData.thread || 0,
+            },
+            {
+                id: 'brand_tags',
+                name: 'Brand Tags (Woven)',
+                unit: 'units',
+                quantity: dbData.main_label || dbData.size_label || 0,
+            },
+            {
+                id: 'buttons',
+                name: 'Metal Buttons / Hooks',
+                unit: 'units',
+                quantity: dbData.buttons || dbData.hook || 0,
+            },
+            {
+                id: 'polybag',
+                name: 'Packaging Polybag',
+                unit: 'units',
+                quantity: dbData.polybag || 0,
+            }
+        ].filter(item => item.quantity !== 0 && item.quantity !== null && item.quantity !== undefined && item.quantity !== '--' && item.quantity !== '0');
+
+        // Material Card Component
+        const MaterialCard = ({ item, globalSize, sizes, garmentName }) => {
+            const [selectedSize, setSelectedSize] = useState(globalSize);
+            const [quantity, setQuantity] = useState(item.quantity);
+            const [isLoading, setIsLoading] = useState(false);
+            
+            // Sync with global size when it changes
+            useEffect(() => {
+                setSelectedSize(globalSize);
+                setQuantity(item.quantity);
+            }, [globalSize, item.quantity]);
+
+            const handleSizeChange = async (e) => {
+                const newSize = e.target.value;
+                setSelectedSize(newSize);
+                setIsLoading(true);
+
+                try {
+                    // Simulate localized DB fetch for THIS specific material
+                    const response = await new Promise(resolve => {
+                        setTimeout(() => resolve({
+                            data: {
+                                main_label: '1 pc',
+                                fabric_full_sleeve: (Math.random() * 0.5 + 1.2).toFixed(2),
+                                thread: Math.floor(Math.random() * 50 + 150),
+                                buttons: Math.floor(Math.random() * 2 + 6),
+                                polybag: '1 pc'
+                            }
+                        }), 600);
+                    });
+
+                    const updatedMaterials = mapDatabaseToMaterials(response.data);
+                    const updatedItem = updatedMaterials.find(m => m.id === item.id);
+                    if (updatedItem) {
+                        setQuantity(updatedItem.quantity);
+                    }
+                } catch (err) {
+                    console.error("Failed to update specific material:", err);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            return (
+                <div className="material-card">
+                    <div className="material-info">
+                        <div className="material-title">{item.name}</div>
+                        <div className="material-qty-wrapper">
+                            <span className="material-qty" style={{ opacity: isLoading ? 0.3 : 1 }}>
+                                {quantity}
+                            </span>
+                            <span className="material-unit">{item.unit}</span>
+                            {isLoading && <div className="card-spinner" style={{ display: 'block' }}></div>}
+                        </div>
+                    </div>
+                    <div className="material-controls">
+                        <div className="control-group">
+                            <label>Select Brand</label>
+                            <select defaultValue="">
+                                <option value="" disabled>Select Supplier...</option>
+                                <option>Supplier A</option>
+                                <option>Supplier B</option>
+                                <option>Supplier C</option>
+                            </select>
+                        </div>
+                        <div className="control-group">
+                            <label>Standard Size</label>
+                            <select value={selectedSize} onChange={handleSizeChange}>
+                                <option value="" disabled>Select size...</option>
+                                {sizes.map(size => (
+                                    <option key={size} value={size}>{size}</option>
+                                ))}
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const BOMCalculator = () => {
+            const [selectedItem, setSelectedItem] = useState('');
+            const [selectedSize, setSelectedSize] = useState('');
+            const [materials, setMaterials] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState(null);
+
+            const availableSizes = sizeMapping[selectedItem] || [];
+
+            useEffect(() => {
+                async function fetchBomData() {
+                    if (!selectedItem || !selectedSize) {
+                        setMaterials([]);
+                        return;
+                    }
+
+                    setIsLoading(true);
+                    setError(null);
+
+                    try {
+                        // Mock DB response as per prompt
+                        const response = await new Promise(resolve => {
+                            setTimeout(() => resolve({
+                                data: {
+                                    main_label: '1 pc',
+                                    size_label: '1 pc',
+                                    fabric_full_sleeve: (Math.random() * 0.5 + 1.2).toFixed(2),
+                                    fabric: '1.5',
+                                    thread: Math.floor(Math.random() * 50 + 150),
+                                    buttons: Math.floor(Math.random() * 2 + 6),
+                                    hook: '1 set',
+                                    polybag: '1 pc'
+                                }
+                            }), 800);
+                        });
+
+                        // REAL IMPLEMENTATION:
+                        // const res = await fetch(\`/api/bom-calculations?item_name=\${selectedItem}&size=\${selectedSize}\`);
+                        // const response = await res.json();
+
+                        if (response.data) {
+                            // Set state exclusively from DB response using the mapping function
+                            setMaterials(mapDatabaseToMaterials(response.data));
+                        }
+                    } catch (err) {
+                        setError("Failed to fetch data from backend database.");
+                    } finally {
+                        setIsLoading(false);
+                    }
+                }
+
+                fetchBomData();
+            }, [selectedItem, selectedSize]);
+
+            const handleItemChange = (e) => {
+                setSelectedItem(e.target.value);
+                setSelectedSize(''); // Reset size when item changes
+            };
+
+            return (
+                <div className="container">
+                    <div className="glass-card">
+                        <div className="header">
+                            <h1>Material Inventory BOM</h1>
+                        </div>
+
+                        <div className="controls">
+                            <div className="form-group">
+                                <label htmlFor="globalItem">Garment Item</label>
+                                <select id="globalItem" value={selectedItem} onChange={handleItemChange}>
+                                    <option value="" disabled>Select Garment...</option>
+                                    <option value="Shirt">Shirt</option>
+                                    <option value="Pant">Pant</option>
+                                    <option value="T-Shirt">T-Shirt</option>
+                                    <option value="Jacket">Jacket</option>
+                                </select>
+                            </div>
+                            <div className="form-group">
+                                <label htmlFor="globalSize">Global Size (Default)</label>
+                                <select 
+                                    id="globalSize" 
+                                    value={selectedSize} 
+                                    onChange={(e) => setSelectedSize(e.target.value)}
+                                    disabled={!selectedItem}
+                                >
+                                    <option value="" disabled>Select size...</option>
+                                    {availableSizes.map(size => (
+                                        <option key={size} value={size}>{size}</option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
+
+                        {error && <div className="alert">{error}</div>}
+
+                        {isLoading ? (
+                            <div className="loader-container">
+                                <div className="spinner"></div>
+                                <div style={{ color: 'var(--text-muted)' }}>Fetching from backend database...</div>
+                            </div>
+                        ) : (
+                            selectedItem && selectedSize ? (
+                                <div className="materials-container">
+                                    {materials.length > 0 ? (
+                                        materials.map(item => (
+                                            <MaterialCard 
+                                                key={item.id} 
+                                                item={item} 
+                                                globalSize={selectedSize}
+                                                sizes={availableSizes}
+                                                garmentName={selectedItem}
+                                            />
+                                        ))
+                                    ) : (
+                                        <div className="empty-state">No material requirements found in the database for this combination.</div>
+                                    )}
+                                </div>
+                            ) : (
+                                <div className="empty-state">Please select a Garment Item and Size to view BOM materials.</div>
+                            )
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<BOMCalculator />);
+    </script>
+</body>
+</html>
