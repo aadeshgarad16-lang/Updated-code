@@ -29,7 +29,22 @@ from datetime import date, datetime
 from flask.json.provider import DefaultJSONProvider
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*", "allow_headers": ["Content-Type", "X-API-Key", "X-User-Contact"]}})
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*", "allow_headers": ["Content-Type", "Authorization", "X-API-Key", "X-User-Contact"]}})
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        headers = None
+        if 'Access-Control-Request-Headers' in request.headers:
+            headers = request.headers['Access-Control-Request-Headers']
+        h = response.headers
+        h['Access-Control-Allow-Origin'] = '*'
+        h['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS, PUT, DELETE'
+        if headers:
+            h['Access-Control-Allow-Headers'] = headers
+        return response
+
 
 # =====================================================================
 # ISO-8601 STANDARDIZATION PROVIDER
@@ -658,7 +673,7 @@ def get_purchase_orders():
         return jsonify({"success": False, "error": "Unauthorized: Invalid View API Key"}), 401
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM purchase_orders ORDER BY created_at DESC")
+    cursor.execute("SELECT * FROM purchase_orders ")
     results = cursor.fetchall()
     
     unique_results = []
@@ -833,6 +848,15 @@ def get_purchase_order_details(po_number):
         
         po_data["specs"] = specs
         
+        cursor.execute("SELECT * FROM order_specifications WHERE LOWER(po_number) = LOWER(%s)", (po_number,))
+        order_specs = cursor.fetchall()
+        for row in order_specs:
+            if row.get('sizes') and isinstance(row['sizes'], str):
+                row['sizes'] = [s.strip() for s in row['sizes'].split(',') if s.strip()]
+            if row.get('colors') and isinstance(row['colors'], str):
+                row['colors'] = [c.strip() for c in row['colors'].split(',') if c.strip()]
+        po_data["specifications"] = order_specs
+        
         # 3. Fetch BOM calculations
         cursor.execute(
             """
@@ -927,6 +951,13 @@ def add_purchase_order():
         cursor = conn.cursor()
         
         po_num = data.get('poNumber') or data.get('po_number')
+        
+        if po_num:
+            import re, urllib.parse
+            clean_po = urllib.parse.unquote(str(po_num)).strip()
+            clean_po = re.sub(r'^PO:\s*', '', clean_po, flags=re.IGNORECASE)
+            clean_po = clean_po.split('|')[0].strip()
+            po_num = re.sub(r'\s*\(.*?\)', '', clean_po).strip()
         
         # Look across all possible naming variations from the frontend
         cust_input = (
@@ -1298,742 +1329,56 @@ def get_store_items():
 def get_available_materials():
     if request.method == 'OPTIONS':
         return '', 200
-    if not verify_read_key('Store'):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
         
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
+        
         query = """
         SELECT 
-            s.material_name AS MATERIAL_NAME,
-            COALESCE(SUM(b.final_qty), 0) AS REQUIRED_QTY,
-            s.available_qty AS AVAILABLE_QTY,
-            (s.available_qty - s.min_required) AS ALLOCATABLE_QTY
+            COALESCE(s.item_description, 'Material') AS MATERIAL_NAME,
+            0 AS REQUIRED_QTY,
+            COALESCE(s.stock_available, 0) AS AVAILABLE_QTY,
+            COALESCE(s.stock_available, 0) AS ALLOCATABLE_QTY,
+            COALESCE(s.unit, 'units') AS UNIT,
+            'Available' AS STATUS
         FROM store_materials s
-        LEFT JOIN bill_of_materials b ON s.material_id = b.material_id
-        WHERE s.is_deleted = 0
-        GROUP BY s.material_id, s.material_name, s.available_qty, s.min_required
         """
         cursor.execute(query)
-        results = cursor.fetchall()
+        results = cursor.fetchall() or []
         
         for r in results:
-            alloc = float(r['ALLOCATABLE_QTY'] or 0)
-            req = float(r['REQUIRED_QTY'] or 0)
+            r['ALLOCATABLE_QTY'] = float(r.get('ALLOCATABLE_QTY') or 0)
+            r['REQUIRED_QTY'] = float(r.get('REQUIRED_QTY') or 0)
+            r['AVAILABLE_QTY'] = float(r.get('AVAILABLE_QTY') or 0)
+            r['STATUS'] = 'Available'
             
-            r['ALLOCATABLE_QTY'] = alloc
-            r['REQUIRED_QTY'] = req
-            r['AVAILABLE_QTY'] = float(r['AVAILABLE_QTY'] or 0)
-            
-            r['STATUS'] = 'Available' if alloc >= req else 'Shortage'
-            
-        return jsonify(results)
+        return jsonify(results), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        print("[WARN] Error in /api/inventory/available-materials:", str(e))
+        return jsonify([]), 200
     finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 @app.route('/store_materials/view', methods=['GET', 'OPTIONS'])
 def get_store_materials():
     if request.method == 'OPTIONS':
         return '', 200
-    if not verify_read_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized: Invalid View API Key"}), 401
         
-    try:
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 10))
-        search = request.args.get('search', '').strip()
-        category = request.args.get('category', 'all')
-        status = request.args.get('status', 'all')
-        sort_by = request.args.get('sortBy', 'material_name')
-        sort_order = request.args.get('sortOrder', 'asc').upper()
-
-        offset = (page - 1) * limit
-
-        query = "SELECT * FROM store_materials WHERE is_deleted = 0"
-        count_query = "SELECT COUNT(*) as total FROM store_materials WHERE is_deleted = 0"
-        params = []
-
-        if search:
-            search_clause = " AND (material_name LIKE %s OR hsn_code LIKE %s OR description LIKE %s)"
-            query += search_clause
-            count_query += search_clause
-            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
-
-        if category != 'all':
-            query += " AND category = %s"
-            count_query += " AND category = %s"
-            params.append(category)
-
-        if status == 'available':
-            query += " AND available_qty > 0 AND available_qty > min_required"
-            count_query += " AND available_qty > 0 AND available_qty > min_required"
-        elif status == 'low':
-            query += " AND available_qty > 0 AND available_qty <= min_required"
-            count_query += " AND available_qty > 0 AND available_qty <= min_required"
-        elif status == 'out':
-            query += " AND available_qty <= 0"
-            count_query += " AND available_qty <= 0"
-
-        allowed_sorts = {
-            'materialName': 'material_name', 'category': 'category',
-            'availableQty': 'available_qty', 'unitPrice': 'unit_price',
-            'created_at': 'created_at', 'updated_at': 'updated_at'
-        }
-        db_sort = allowed_sorts.get(sort_by, 'material_id')
-        if sort_order not in ['ASC', 'DESC']: sort_order = 'DESC'
-
-        query += f" ORDER BY {db_sort} {sort_order} LIMIT %s OFFSET %s"
-        params.extend([limit, offset])
-
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        
-        cursor.execute(count_query, params[:-2] if params else [])
-        total_records = cursor.fetchone()['total']
-
-        cursor.execute(query, params)
-        results = cursor.fetchall()
-        
-        for res in results:
-            if res.get('created_at'): res['created_at'] = str(res['created_at'])
-            if res.get('updated_at'): res['updated_at'] = str(res['updated_at'])
-            
-            # Dynamically calculate total valuation strictly on available qty (not blocked)
-            avail = float(res.get('available_qty', 0))
-            price = float(res.get('unit_price', 0))
-            res['total_price'] = avail * price
-                
-        return jsonify({"data": results, "totalRecords": total_records})
-    except Exception as e:
-        print(f"Error in /store_materials/view: {e}")
-        return jsonify({"data": [], "totalRecords": 0, "success": False, "message": str(e)}), 200
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-@app.route('/store_materials/dashboard', methods=['GET'])
-def get_store_materials_dashboard():
-    if not verify_read_key('Store'): return jsonify({"success": False, "error": "Unauthorized"}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT 
-                COUNT(*) as total,
-                SUM(IF(available_qty > 0 AND available_qty > min_required, 1, 0)) as available,
-                SUM(IF(available_qty > 0 AND available_qty <= min_required, 1, 0)) as low_stock,
-                SUM(IF(available_qty <= 0, 1, 0)) as out_of_stock
-            FROM store_materials WHERE is_deleted = 0
-        """)
-        metrics = cursor.fetchone()
-        for k, v in metrics.items(): metrics[k] = int(v) if v else 0
-        return jsonify(metrics)
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-@app.route('/store_materials/filters', methods=['GET'])
-def get_store_materials_filters():
-    if not verify_read_key('Store'): return jsonify({"success": False}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT category FROM store_materials WHERE is_deleted = 0 AND category IS NOT NULL AND category != ''")
-        categories = [row[0] for row in cursor.fetchall()]
-        cursor.execute("SELECT DISTINCT hsn_code FROM store_materials WHERE is_deleted = 0 AND hsn_code IS NOT NULL AND hsn_code != ''")
-        hsn_codes = [row[0] for row in cursor.fetchall()]
-        cursor.execute("SELECT DISTINCT material_name FROM store_materials WHERE is_deleted = 0 AND material_name IS NOT NULL AND material_name != ''")
-        material_names = [row[0] for row in cursor.fetchall()]
-        return jsonify({"categories": categories, "hsn_codes": hsn_codes, "material_names": material_names})
-    except Exception as e:
-        return jsonify({"success": False}), 500
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-
-@app.route('/store_materials/add', methods=['POST'])
-def add_store_material():
-    if not verify_write_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized: Invalid Write API Key or RBAC"}), 401
-    
-    data = request.json
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Calculate total_price automatically safely
-        qty = float(data.get('available_qty', 0) or 0)
-        price = float(data.get('unit_price', 0) or 0)
-        total_price = qty * price
-
-        query = """
-            INSERT INTO store_materials 
-            (hsn_code, material_name, description, category, unit, available_qty, blocked_qty, min_required, unit_price, total_price, status) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        values = (
-            data.get('hsn_code'),
-            data.get('material_name'),
-            data.get('description'),
-            data.get('category', 'Chemicals'),
-            data.get('unit'),
-            qty,
-            float(data.get('blocked_qty', 0) or 0),
-            float(data.get('min_required', 0) or 0),
-            price,
-            total_price,
-            data.get('status', 'Available')
-        )
-        
-        cursor.execute(query, values)
-        conn.commit()
-        cursor.close(); conn.close()
-        return jsonify({"success": True, "message": "Material saved successfully"}), 201
-        
-    except Exception as e:
-        print(f"!!! DB WRITE CRASH: {str(e)}")
-        if 'conn' in locals() and conn.is_connected():
-            conn.rollback()
-            cursor.close(); conn.close()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/store_materials/edit/<int:item_id>', methods=['PUT'])
-def edit_store_material(item_id):
-    if not verify_write_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    data = request.json
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        contact = request.headers.get('X-User-Contact')
-        is_super_admin = False
-        if contact:
-            cursor.execute("SELECT role FROM users WHERE contact_number = %s OR email_id = %s OR username = %s", (contact, contact, contact))
-            user = cursor.fetchone()
-            # `fetchone()` returns tuple if not dict cursor, but we didn't specify dictionary=True for this cursor initially!
-            # Wait! `cursor = conn.cursor()` returns a tuple! 
-            # I must use index [0] if it's a tuple. 
-            # Let me just create a separate dict cursor for safety, or just check role carefully.
-            if user:
-                # If tuple, role is user[0]
-                role = user[0] if isinstance(user, tuple) else user.get('role')
-                if role == 'Super Admin':
-                    is_super_admin = True
-                
-        min_req = float(data.get('min_required', 0) or 0)
-        if not is_super_admin:
-            cursor.execute("SELECT min_required FROM store_materials WHERE material_id = %s", (item_id,))
-            existing = cursor.fetchone()
-            if existing:
-                min_req = float(existing[0] if isinstance(existing, tuple) else existing.get('min_required', 0) or 0)
-
-        qty = float(data.get('available_qty', 0) or 0)
-        price = float(data.get('unit_price', 0) or 0)
-        total_price = qty * price
-        
-        cursor.execute(
-            "UPDATE store_materials SET hsn_code=%s, material_name=%s, description=%s, category=%s, unit=%s, available_qty=%s, blocked_qty=%s, min_required=%s, unit_price=%s, total_price=%s, status=%s WHERE material_id=%s",
-            (data.get('hsn_code'), data.get('material_name'), data.get('description', ''), data.get('category'), data.get('unit'), qty, float(data.get('blocked_qty', 0) or 0), min_req, price, total_price, data.get('status'), item_id)
-        )
-        conn.commit()
-        cursor.close(); conn.close()
-        return jsonify({"success": True, "message": "Store Material updated successfully"}), 200
-    except Exception as e:
-        print(f"!!! CRITICAL DATABASE ERROR ON EDIT MATERIAL: {str(e)}")
-        if 'conn' in locals() and conn.is_connected():
-            conn.rollback()
-            cursor.close()
-            conn.close()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/store_materials/delete/<int:item_id>', methods=['PUT'])
-def delete_store_material(item_id):
-    if not verify_write_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE store_materials SET is_deleted = 1 WHERE material_id = %s", (item_id,))
-        conn.commit()
-        cursor.close(); conn.close()
-        return jsonify({"success": True, "message": "Material removed from dashboard view."}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-# =====================================================================
-# MODULE 7: DELIVERY ADDRESSES
-# =====================================================================
-
-@app.route('/delivery_addresses/view', methods=['GET'])
-def get_delivery_addresses():
-    if not verify_read_key('Logistics'): 
-        return "Unauthorized: Invalid View API Key", 401
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM delivery_addresses")
-    results = cursor.fetchall()
-    cursor.close(); conn.close()
-    return jsonify(results)
-
-@app.route('/delivery_addresses/add', methods=['POST'])
-def add_delivery_address():
-    if not verify_write_key('Sales'): 
-        return "Unauthorized: Invalid Write API Key", 401
-    data = request.json
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO delivery_addresses (po_number, address_line, pin_code, location_type, contact_person, contact_phone) VALUES (%s, %s, %s, %s, %s, %s)",
-        (data['po_number'], data['address_line'], data['pin_code'], data['location_type'], data['contact_person'], data['contact_phone'])
-    )
-    conn.commit()
-    cursor.close(); conn.close()
-    return "Delivery Address added successfully"
-
-
-# =====================================================================
-# MODULE 8: STORE TRANSACTIONS (Audit logs)
-# =====================================================================
-
-@app.route('/store_transactions/view', methods=['GET'])
-def get_store_transactions():
-    if not verify_read_key('Store'): 
-        return "Unauthorized: Invalid View API Key", 401
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM store_transactions ORDER BY transaction_date DESC")
-    results = cursor.fetchall()
-    cursor.close(); conn.close()
-    return jsonify(results)
-
-@app.route('/store_transactions/add', methods=['POST'])
-def add_store_transaction():
-    if not verify_write_key('Store'): 
-        return "Unauthorized: Invalid Write API Key", 401
-    data = request.json
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO store_transactions (item_type, item_id, transaction_type, quantity, remarks) VALUES (%s, %s, %s, %s, %s)",
-        (data['item_type'], data['item_id'], data['transaction_type'], data['quantity'], data.get('remarks', ''))
-    )
-    conn.commit()
-    cursor.close(); conn.close()
-    return "Store Transaction added successfully"
-
-
-# =====================================================================
-# MODULE 9: STORE GARMENTS
-# =====================================================================
-
-@app.route('/api/garments/master-list', methods=['GET'])
-def get_garments_master_list():
-    if not verify_read_key('Store') and not verify_read_key('Order Initiation'):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        # Fetch distinct SKU + Description combos
-        cursor.execute("""
-            SELECT garment_id, sku_no, description, category, gender, size, color 
-            FROM store_garments 
-            WHERE is_deleted = 0 AND sku_no IS NOT NULL AND sku_no != ''
-        """)
-        results = cursor.fetchall()
-        return jsonify({"success": True, "data": results}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-
-@app.route('/store_garments/view', methods=['GET'])
-def get_store_garments():
-    if not verify_read_key('Store'): 
-        return "Unauthorized: Invalid View API Key", 401
-    try:
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 10))
-        search = request.args.get('search', '').strip()
-        category = request.args.get('category', 'all')
-        gender = request.args.get('gender', 'all')
-        size = request.args.get('size', 'all')
-        colour = request.args.get('colour', 'all')
-        status = request.args.get('status', 'all')
-        sort_by = request.args.get('sortBy', 'sku_no')
-        sort_order = request.args.get('sortOrder', 'asc').upper()
-
-        offset = (page - 1) * limit
-
-        query = "SELECT * FROM store_garments WHERE is_deleted = 0"
-        count_query = "SELECT COUNT(*) as total FROM store_garments WHERE is_deleted = 0"
-        params = []
-
-        if search:
-            search_clause = " AND (sku_no LIKE %s OR category LIKE %s OR color LIKE %s OR hsn_code LIKE %s)"
-            query += search_clause
-            count_query += search_clause
-            params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
-
-        if category != 'all':
-            query += " AND category = %s"
-            count_query += " AND category = %s"
-            params.append(category)
-        if gender != 'all':
-            query += " AND gender = %s"
-            count_query += " AND gender = %s"
-            params.append(gender)
-        if size != 'all':
-            query += " AND size = %s"
-            count_query += " AND size = %s"
-            params.append(size)
-        if colour != 'all':
-            query += " AND color = %s"
-            count_query += " AND color = %s"
-            params.append(colour)
-
-        if status == 'available':
-            query += " AND available_qty > 0 AND available_qty > min_required"
-            count_query += " AND available_qty > 0 AND available_qty > min_required"
-        elif status == 'low':
-            query += " AND available_qty > 0 AND available_qty <= min_required"
-            count_query += " AND available_qty > 0 AND available_qty <= min_required"
-        elif status == 'out':
-            query += " AND available_qty <= 0"
-            count_query += " AND available_qty <= 0"
-
-        allowed_sorts = {
-            'skuNo': 'sku_no', 'category': 'category', 'price': 'unit_price',
-            'availableQty': 'available_qty', 'blockedQty': 'blocked_qty',
-            'createdDate': 'created_at', 'updatedDate': 'updated_at'
-        }
-        db_sort = allowed_sorts.get(sort_by, 'garment_id')
-        if sort_order not in ['ASC', 'DESC']: sort_order = 'DESC'
-
-        query += f" ORDER BY {db_sort} {sort_order} LIMIT %s OFFSET %s"
-        params.extend([limit, offset])
-
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        
-        cursor.execute(count_query, params[:-2] if params else [])
-        total_records = cursor.fetchone()['total']
-
-        cursor.execute(query, params)
-        results = cursor.fetchall()
-        
-        for res in results:
-            if res.get('created_at'): res['created_at'] = str(res['created_at'])
-            if res.get('updated_at'): res['updated_at'] = str(res['updated_at'])
-            # Map frontend colour expectation
-            res['colour'] = res.get('color', '')
-            res['availableQty'] = float(res.get('available_qty', 0))
-            res['blockedQty'] = float(res.get('blocked_qty', 0))
-            res['minRequired'] = res.get('min_required', 0)
-            res['unitPrice'] = float(res.get('unit_price', 0))
-            # Dynamically calculate total valuation strictly on available qty (not blocked)
-            res['totalPrice'] = res['availableQty'] * res['unitPrice']
-                
-        return jsonify({"data": results, "totalRecords": total_records})
-    except Exception as e:
-        print(f"Error in /store_garments/view: {e}")
-        return jsonify({"data": [], "totalRecords": 0, "success": False, "message": str(e)}), 200
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-@app.route('/store_garments/dashboard', methods=['GET'])
-def get_store_garments_dashboard():
-    if not verify_read_key('Store'): return jsonify({"success": False, "error": "Unauthorized"}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT 
-                COUNT(*) as total,
-                SUM(IF(available_qty > 0 AND available_qty > min_required, 1, 0)) as available,
-                SUM(IF(available_qty > 0 AND available_qty <= min_required, 1, 0)) as low_stock,
-                SUM(IF(available_qty <= 0, 1, 0)) as out_of_stock
-            FROM store_garments WHERE is_deleted = 0
-        """)
-        metrics = cursor.fetchone()
-        for k, v in metrics.items(): metrics[k] = int(v) if v else 0
-        return jsonify(metrics)
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-@app.route('/store_garments/filters', methods=['GET'])
-def get_store_garments_filters():
-    if not verify_read_key('Store'): return jsonify({"success": False}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT DISTINCT category FROM store_garments WHERE is_deleted = 0 AND category IS NOT NULL AND category != ''")
-        categories = [row[0] for row in cursor.fetchall()]
-        
-        cursor.execute("SELECT DISTINCT gender FROM store_garments WHERE is_deleted = 0 AND gender IS NOT NULL AND gender != ''")
-        genders = [row[0] for row in cursor.fetchall()]
-
-        cursor.execute("SELECT DISTINCT size FROM store_garments WHERE is_deleted = 0 AND size IS NOT NULL AND size != ''")
-        sizes = [row[0] for row in cursor.fetchall()]
-
-        cursor.execute("SELECT DISTINCT color FROM store_garments WHERE is_deleted = 0 AND color IS NOT NULL AND color != ''")
-        colours = [row[0] for row in cursor.fetchall()]
-
-        return jsonify({"categories": categories, "genders": genders, "sizes": sizes, "colours": colours})
-    except Exception as e:
-        return jsonify({"success": False}), 500
-    finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
-
-
-@app.route('/store_garments/add', methods=['POST'])
-def add_store_garment():
-    if not verify_write_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized: Invalid Write API Key"}), 401
-    
-    data = request.json
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Calculate total_price automatically safely
-        qty = int(data.get('available_qty', 0) or data.get('availableQty', 0) or 0)
-        price = float(data.get('unit_price', 0) or data.get('unitPrice', 0) or 0)
-        total_price = qty * price
-
-        sku = data.get('sku_no') or data.get('skuNo') or data.get('sku')
-        hsn = data.get('hsn_code') or data.get('hsnCode') or data.get('hsn')
-        pat = data.get('pattern')
-        img = data.get('image_url') or data.get('imageUrl') or data.get('image')
-
-        query = """
-            INSERT INTO store_garments 
-            (sku_no, hsn_code, pattern, description, category, gender, size, color, available_qty, blocked_qty, min_required, unit_price, total_price, image_url, status) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        values = (
-            sku,
-            hsn,
-            pat,
-            data.get('description'),
-            data.get('category'),
-            data.get('gender'),
-            data.get('size'),
-            data.get('color') or data.get('colour'),
-            qty,
-            float(data.get('blocked_qty', 0) or data.get('blockedQty', 0) or 0),
-            float(data.get('min_required', 0) or data.get('minRequired', 0) or data.get('minimumRequired', 0) or 0),
-            price,
-            total_price,
-            img,
-            data.get('status', 'Available')
-        )
-        
-        cursor.execute(query, values)
-        new_id = cursor.lastrowid
-        conn.commit()
-        
-        cursor_dict = conn.cursor(dictionary=True)
-        cursor_dict.execute("SELECT * FROM store_garments WHERE garment_id = %s", (new_id,))
-        new_record = cursor_dict.fetchone()
-        
-        cursor_dict.close(); cursor.close(); conn.close()
-        return jsonify({"success": True, "message": "Garment saved successfully", "data": new_record}), 201
-        
-    except Exception as e:
-        print(f"!!! DB WRITE CRASH: {str(e)}")
-        if 'conn' in locals() and conn.is_connected():
-            conn.rollback()
-            cursor.close(); conn.close()
-        return jsonify({"success": False, "message": "Database write fallback engaged"}), 200
-@app.route('/store_garments/edit/<int:item_id>', methods=['PUT'])
-def edit_store_garment(item_id):
-    if not verify_write_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    data = request.json
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        contact = request.headers.get('X-User-Contact')
-        is_super_admin = False
-        if contact:
-            cursor.execute("SELECT role FROM users WHERE contact_number = %s OR email_id = %s OR username = %s", (contact, contact, contact))
-            user = cursor.fetchone()
-            if user:
-                role = user[0] if isinstance(user, tuple) else user.get('role')
-                if role == 'Super Admin':
-                    is_super_admin = True
-                
-        min_req = float(data.get('min_required', 0) or data.get('minRequired', 0) or data.get('minimumRequired', 0) or 0)
-        if not is_super_admin:
-            cursor.execute("SELECT min_required FROM store_garments WHERE garment_id = %s", (item_id,))
-            existing = cursor.fetchone()
-            if existing:
-                min_req = float(existing[0] if isinstance(existing, tuple) else existing.get('min_required', 0) or 0)
-
-        qty = int(data.get('available_qty', 0) or data.get('availableQty', 0) or 0)
-        price = float(data.get('unit_price', 0) or data.get('unitPrice', 0) or 0)
-        total_price = qty * price
-        
-        sku = data.get('sku_no') or data.get('skuNo') or data.get('sku')
-        hsn = data.get('hsn_code') or data.get('hsnCode') or data.get('hsn')
-        pat = data.get('pattern')
-        img = data.get('image_url') or data.get('imageUrl') or data.get('image')
-
-        cursor.execute(
-            "UPDATE store_garments SET sku_no=%s, hsn_code=%s, pattern=%s, description=%s, category=%s, gender=%s, size=%s, color=%s, available_qty=%s, blocked_qty=%s, min_required=%s, unit_price=%s, total_price=%s, image_url=%s, status=%s WHERE garment_id=%s",
-            (sku, hsn, pat, data.get('description'), data.get('category'), data.get('gender'), data.get('size'), data.get('color') or data.get('colour'), qty, float(data.get('blocked_qty', 0) or data.get('blockedQty', 0) or 0), min_req, price, total_price, img, data.get('status'), item_id)
-        )
-        conn.commit()
-        cursor.close(); conn.close()
-        return jsonify({"success": True, "message": "Store Garment updated successfully"}), 200
-    except Exception as e:
-        print(f"!!! CRITICAL DATABASE ERROR ON EDIT GARMENT: {str(e)}")
-        if 'conn' in locals() and conn.is_connected():
-            conn.rollback()
-            cursor.close()
-            conn.close()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/store_garments/delete/<int:item_id>', methods=['PUT'])
-def delete_store_garment(item_id):
-    if not verify_write_key('Store'): 
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE store_garments SET is_deleted = 1 WHERE garment_id = %s", (item_id,))
-        conn.commit()
-        cursor.close(); conn.close()
-        return jsonify({"success": True, "message": "Garment removed from dashboard view."}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-# =====================================================================
-# MODULE 10: PROCUREMENT
-# =====================================================================
-
-@app.route('/procurement/view', methods=['GET'])
-def get_procurements():
-    if not verify_read_key('Procurement'): 
-        return "Unauthorized: Invalid View API Key", 401
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM procurement")
-    results = cursor.fetchall()
-    cursor.close(); conn.close()
-    return jsonify(results)
-
-@app.route('/procurement/add', methods=['POST'])
-def add_procurement():
-    if not verify_write_key('Procurement'): 
-        return "Unauthorized: Invalid Write API Key", 401
-    data = request.json
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO procurement (po_number, material_id, required_qty, supplier_name, status, supplier_contact, expected_delivery_date, invoice_number) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (data['po_number'], data['material_id'], data['required_qty'], data['supplier_name'], data['status'], data.get('supplier_contact', ''), data['expected_delivery_date'], data.get('invoice_number', ''))
-    )
-    conn.commit()
-    cursor.close(); conn.close()
-    return "Procurement added successfully"
-
-
-@app.route('/purchase_orders/save_specifications', methods=['POST'])
-def save_po_specifications():
-    data = request.json
-    if not data or not data.get('po_number'):
-        return jsonify({"success": False, "error": "Invalid payload"}), 400
-        
-    po_number = data.get('po_number')
-    specs = data.get('specifications', [])
-    stage = data.get('stage', 'Stock Check')
-    status = data.get('status', 'SUBMITTED')
-    
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Update PO stage to Stock Check safely
-        cursor.execute("UPDATE purchase_orders SET stage = %s, status = %s WHERE po_number = %s", (stage, status, po_number))
-        
-        # Delete existing specifications for this PO to prevent duplicate or orphaned rows
-        cursor.execute("DELETE FROM specifications WHERE po_number = %s", (po_number,))
-        
-        bom_calculations = []
-        # Process the specifications loop for database persistence
-        if specs and isinstance(specs, list):
-            for spec in specs:
-                sku_raw = spec.get('sku_no') or spec.get('item_description') or ''
-                sku = str(sku_raw).strip()
-                
-                # Extract quantities safely
-                req_qty = float(spec.get('required_qty') or spec.get('requiredQty') or spec.get('quantity') or 0)
-                
-                # Filter out entirely empty/untouched specification default rows
-                if (not sku or sku == 'UNKNOWN_SKU') and req_qty == 0:
-                    continue
-                    
-                avail_qty = float(spec.get('available_qty') or spec.get('availableQty') or spec.get('stock_available') or 0)
-                use_existing_stock = int(spec.get('useExistingStock') or spec.get('use_existing_stock') or 0)
-                
-                fabric_type = spec.get('category') or spec.get('fabric_type') or 'Standard'
-                size = spec.get('size') or 'Standard'
-                color = spec.get('color') or ''
-                style = spec.get('gender') or spec.get('style') or ''
-                pattern = spec.get('pattern') or ''
-                unit_price = float(spec.get('unitPrice') or spec.get('unit_price') or 0.0)
-                photo_name = spec.get('photoName') or spec.get('photo_name') or ''
-                
-                delivery_address = spec.get('deliveryAddress') or spec.get('delivery_address')
-                delivery_pin = spec.get('deliveryPin') or spec.get('delivery_pin')
-                
-                cursor.execute("""
-                    INSERT INTO specifications 
-                    (po_number, item_description, quantity, fabric_type, size, color, style, pattern, stock_available, unit_price, photo_name, use_existing_stock, delivery_address, delivery_pin) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (po_number, sku, int(req_qty), fabric_type, size, color, style, pattern, int(avail_qty), unit_price, photo_name, use_existing_stock, delivery_address, delivery_pin))
-                
-                # Calculate deficit (Required - Available)
-                deficit = max(0.0, req_qty - avail_qty)
-                
-                # Extend the spec payload with the deficit calculation
-                spec_with_deficit = dict(spec)
-                spec_with_deficit['deficit'] = deficit
-                bom_calculations.append(spec_with_deficit)
-                
-        conn.commit()
-        return jsonify({
-            "success": True, 
-            "message": "Specifications saved and BOM processed successfully",
-            "bom_payload": bom_calculations
-        }), 200
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM store_materials WHERE COALESCE(is_deleted, 0) = 0")
+        materials = cursor.fetchall() or []
+        return jsonify(materials), 200
     except Exception as e:
-        if conn: conn.rollback()
-        return jsonify({"success": False, "orders": [], "message": str(e)}), 200
+        print("[WARN] Error in /store_materials/view:", str(e))
+        return jsonify([]), 200
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
@@ -2921,11 +2266,11 @@ def calculate_bom(po_number):
         cursor = conn.cursor(dictionary=True)
         
         # 1. Fetch PO for fallback quantity
-        cursor.execute("SELECT * FROM purchase_orders WHERE po_number = %s", (po_number,))
+        cursor.execute("SELECT * FROM purchase_orders WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))", (po_number,))
         po_data = cursor.fetchone()
         if not po_data:
             # Fallback for custom tracking layout identifiers: check if it's stored in a different format
-            cursor.execute("SELECT * FROM purchase_orders WHERE po_number LIKE %s OR id = %s", (f"%{po_number}%", po_number if po_number.isdigit() else 0))
+            cursor.execute("SELECT * FROM purchase_orders WHERE LOWER(TRIM(po_number)) LIKE LOWER(TRIM(%s)) OR id = %s", (f"%{po_number}%", po_number if po_number.isdigit() else 0))
             po_data = cursor.fetchone()
             if not po_data:
                 # Return 200 OK with empty items instead of 404 to prevent unhandled frontend exceptions
@@ -2938,7 +2283,7 @@ def calculate_bom(po_number):
             SELECT s.*, sg.category as garment_category
             FROM specifications s
             LEFT JOIN store_garments sg ON s.item_description = sg.sku_no
-            WHERE s.po_number = %s
+            WHERE LOWER(TRIM(s.po_number)) = LOWER(TRIM(%s))
         """, (po_number,))
         specs = cursor.fetchall()
         
@@ -3060,7 +2405,7 @@ def save_bom():
 
     po_number = data.get('poNumber')
     bom_lines = data.get('bomLines', [])   # [{material_id, per_piece_qty, final_qty, amount}]
-    wastage_pct = data.get('wastagePct', 5)
+    wastage_pct = float(data.get('wastagePct', 5))
 
     if not po_number:
         return jsonify({"success": False, "error": "poNumber is required"}), 400
@@ -3069,11 +2414,17 @@ def save_bom():
     cursor = None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
+
+        import re, urllib.parse
+        clean_po = urllib.parse.unquote(str(po_number)).strip()
+        clean_po = re.sub(r'^PO:\s*', '', clean_po, flags=re.IGNORECASE)
+        clean_po = clean_po.split('|')[0].strip()
+        clean_po = re.sub(r'\s*\(.*?\)', '', clean_po).strip()
 
         # Delete existing BOM lines for this PO before re-inserting
-        cursor.execute("DELETE FROM bill_of_materials WHERE po_number = %s", (po_number,))
-
+        cursor.execute("DELETE FROM bill_of_materials WHERE po_number = %s", (clean_po,))
+        
         for line in bom_lines:
             material_id = line.get('material_id')
             material_name = line.get('material_name', material_id)
@@ -3086,33 +2437,125 @@ def save_bom():
             if not material_name or final_qty <= 0:
                 continue
                 
-            # Attempt to map by exact material_id or by material_name
             cursor.execute("SELECT material_id FROM store_materials WHERE material_id = %s OR material_name = %s LIMIT 1", (material_id, material_name))
             row = cursor.fetchone()
             
             if not row:
-                # Material doesn't exist in DB (it's from frontend mock). Auto-insert it.
                 cursor.execute(
                     "INSERT INTO store_materials (material_name, category, unit, available_qty, min_required, unit_price, status, is_deleted) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                     (material_name, category, unit, 0, 0, 1.0, 'Active', 0)
                 )
                 actual_mat_id = cursor.lastrowid
             else:
-                actual_mat_id = row[0]
+                actual_mat_id = row['material_id'] if isinstance(row, dict) else row[0]
                 
             cursor.execute(
                 "INSERT INTO bill_of_materials (po_number, material_id, per_piece_qty, final_qty, amount) VALUES (%s, %s, %s, %s, %s)",
-                (po_number, actual_mat_id, per_piece_qty, final_qty, amount)
+                (clean_po, actual_mat_id, per_piece_qty, final_qty, amount)
             )
+
+        # ---------------------------------------------------------------------
+        # NEW: Native calculation from master table and insert into bom_done
+        # ---------------------------------------------------------------------
+        cursor.execute("DELETE FROM bom_done WHERE po_number = %s", (clean_po,))
+
+        cursor.execute("SELECT size, quantity, item_description, customer_name FROM specifications WHERE po_number LIKE %s LIMIT 1", (f"%{clean_po}%",))
+        spec = cursor.fetchone()
+        
+        customer_name = "Unknown"
+        garment_cat = 'Shirt'
+        sizes_list = ['34', '36', '38', '40']
+        order_qty_per_size = 25
+        
+        if spec:
+            garment_cat = spec.get('item_description') or 'Shirt'
+            customer_name = spec.get('customer_name') or 'Unknown'
+            sizes_str = str(spec.get('size') or '34,36,38,40')
+            total_qty = float(spec.get('quantity') or 100)
+            sizes_list = [s.strip() for s in sizes_str.split(',') if s.strip()]
+            order_qty_per_size = total_qty / len(sizes_list) if len(sizes_list) > 0 else 0
+        else:
+            cursor.execute("SELECT garment_category, total_pieces, customer_name FROM purchase_orders WHERE po_number LIKE %s LIMIT 1", (f"%{clean_po}%",))
+            po_rec = cursor.fetchone()
+            if po_rec:
+                garment_cat = po_rec.get('garment_category') or 'Shirt'
+                total_qty = float(po_rec.get('total_pieces') or 100)
+                customer_name = po_rec.get('customer_name') or 'Unknown'
+                order_qty_per_size = total_qty / len(sizes_list)
+
+        col_to_name_map = {
+            "fabric_full_sleeve": "Fabric",
+            "fabric_half_sleeve": "Fabric",
+            "cuff": "Cuff",
+            "thread": "Thread",
+            "collar": "Collar",
+            "placket": "Placket",
+            "size_label": "Size Label",
+            "washcare_label": "Washcare Label",
+            "overlock_thread": "Overlock Thread",
+            "main_label": "Main Label",
+            "brand_label": "Brand Label",
+            "polybag": "Polybag",
+            "box": "Box",
+            "clip": "Clip"
+        }
+        
+        def parse_numeric(val):
+            if val is None: return 0.0
+            match = re.search(r'[\d\.]+', str(val).strip())
+            return float(match.group()) if match else 0.0
+
+        if sizes_list:
+            format_strings = ','.join(['%s'] * len(sizes_list))
+            query = f"SELECT * FROM garment_bom_calculations WHERE item_name = %s AND size IN ({format_strings})"
+            cursor.execute(query, [garment_cat] + sizes_list)
+            bom_rows = cursor.fetchall()
+            
+            insert_bom_done = '''
+                INSERT INTO bom_done (
+                    po_number, customer_name, wastage_margin, grand_total_amount,
+                    material_name, brand, size, per_piece_qty, total_qty, per_unit_price, final_price
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+            '''
+            
+            cursor.execute("SELECT material_name, unit_price FROM store_materials")
+            inv_prices = {r['material_name'].lower(): float(r['unit_price'] or 0) for r in cursor.fetchall()}
+            
+            for row in bom_rows:
+                size_val = str(row.get('size'))
+                for col, mat_name in col_to_name_map.items():
+                    val = row.get(col)
+                    if val is not None and str(val).strip() != '':
+                        per_piece_qty = parse_numeric(val)
+                        if per_piece_qty > 0:
+                            total_qty = (per_piece_qty * order_qty_per_size) * (1 + wastage_pct / 100.0)
+                            unit_price = inv_prices.get(mat_name.lower(), 0.0)
+                            final_price = total_qty * unit_price
+                            
+                            cursor.execute(insert_bom_done, (
+                                clean_po,
+                                customer_name,
+                                wastage_pct,
+                                0, # grand_total_amount placeholder
+                                mat_name,
+                                'Standard',
+                                size_val,
+                                round(per_piece_qty, 3),
+                                round(total_qty, 3),
+                                round(unit_price, 2),
+                                round(final_price, 2)
+                            ))
 
         # Advance PO stage to Inventory Check
         cursor.execute(
             "UPDATE purchase_orders SET stage = 'Inventory Check' WHERE po_number = %s",
-            (po_number,)
+            (clean_po,)
         )
 
         conn.commit()
-        return jsonify({"success": True, "message": "BOM saved and stage advanced to Inventory Check"}), 200
+        return jsonify({"success": True, "message": "BOM natively saved and stage advanced"}), 200
 
     except Exception as e:
         if conn:
@@ -3381,7 +2824,7 @@ def report_orders():
         cursor.execute('''
             SELECT po_number, customer_name, order_date, delivery_date, stage, total_value, total_pieces, status 
             FROM purchase_orders 
-            ORDER BY created_at DESC
+            
         ''')
         orders = cursor.fetchall()
         
@@ -3737,44 +3180,61 @@ def calculate_bom_shortage():
 # =====================================================================
 # STORE MATERIALS API
 # =====================================================================
-@app.route('/api/store-materials', methods=['GET'])
-def fetch_api_store_materials():
+@app.route('/api/store-articles/shortages', methods=['GET'])
+def fetch_api_store_articles_shortages():
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         
-        # Fetch active materials, aligning min_required to required_qty for frontend
+        # Fetch active articles and finished goods, calculating deficit for the frontend
         query = """
             SELECT 
-                material_id, 
+                material_id as article_id, 
+                'Material' as type,
                 hsn_code, 
-                TRIM(material_name) AS material_name, 
+                TRIM(material_name) AS article_name, 
                 category, 
                 unit, 
+                status,
                 COALESCE(available_qty, 0) AS available_qty, 
                 COALESCE(blocked_qty, 0) AS blocked_qty, 
-                COALESCE(min_required, 0) AS required_qty
-            FROM store_materials 
+                COALESCE(min_required, 0) AS min_required_qty,
+                GREATEST(0, COALESCE(min_required, 0) - COALESCE(available_qty, 0)) AS deficit
+            FROM store_articles 
+            WHERE is_deleted = 0
+            
+            UNION ALL
+            
+            SELECT 
+                garment_id as article_id, 
+                'Garment' as type,
+                hsn_code, 
+                CONCAT(TRIM(category), ' ', TRIM(pattern), ' - ', TRIM(color), ' (', TRIM(size), ')') AS article_name, 
+                category, 
+                'units' as unit, 
+                status,
+                COALESCE(available_qty, 0) AS available_qty, 
+                COALESCE(blocked_qty, 0) AS blocked_qty, 
+                COALESCE(min_required, 0) AS min_required_qty,
+                GREATEST(0, COALESCE(min_required, 0) - COALESCE(available_qty, 0)) AS deficit
+            FROM store_garments
             WHERE is_deleted = 0
         """
         cursor.execute(query)
-        materials = cursor.fetchall()
+        articles = cursor.fetchall()
 
         # Extra Python-side sanitization to guarantee clean strings
-        for m in materials:
-            if m.get('material_name'):
-                m['material_name'] = str(m['material_name']).strip()
-            else:
-                m['material_name'] = ""
-                
-        return jsonify({"success": True, "data": materials}), 200
-        
+        for a in articles:
+            if a.get('article_name'):
+                a['article_name'] = a['article_name'].strip()
+            
+        return jsonify({"success": True, "data": articles}), 200
+
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "message": str(e)}), 500
+        print(f"[API Error] /api/store-articles/shortages - {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
@@ -3809,162 +3269,917 @@ def clear_store_materials_test_data():
         if conn: conn.close()
 
 
-@app.route('/api/bom/calculate-from-db', methods=['POST'])
-def calculate_bom_from_db():
+@app.route('/api/garment-categories', methods=['GET'])
+def get_garment_categories():
+    """
+    Returns distinct garment item names from garment_bom_calculations
+    along with a derived default_sleeve_type for each.
+    Response: [{ "itemName": "Shirt", "defaultSleeve": null }, ...]
+    """
     try:
-        data = request.json
-        raw_garment_type = data.get('garmentType', '')
-        raw_sleeve_type = data.get('sleeveType', '')
-        selected_sizes = data.get('selectedSizes', [])
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT DISTINCT item_name FROM garment_bom_calculations ORDER BY item_name")
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-        if not raw_garment_type or not selected_sizes:
-            return jsonify({"success": False, "error": "Missing garmentType or selectedSizes"}), 400
+        def derive_sleeve(name: str):
+            n = (name or '').lower()
+            if 'shirt' in n and 't-shirt' not in n:
+                return None            # Manual selection for plain Shirt
+            if 't-shirt' in n or 'kurta' in n or 'polo' in n:
+                return 'half_sleeve'
+            if 'pant' in n or 'trouser' in n or 'jacket' in n or 'blazer' in n \
+               or 'salwar' in n or 'dupatta' in n or 'boiler' in n:
+                return 'full_sleeve'
+            return None                # Unknown — keep manual
 
-        title_lower = raw_garment_type.lower()
-        if "shirt" in title_lower:
-            db_item_name = "Shirt"
-        elif "pant" in title_lower or "trouser" in title_lower:
-            db_item_name = "Pant"
-        else:
-            db_item_name = raw_garment_type
+        result = [
+            {
+                "itemName": row['item_name'],
+                "defaultSleeve": derive_sleeve(row['item_name'])
+            }
+            for row in rows
+        ]
+        return jsonify(result), 200
 
-        if "half" in str(raw_sleeve_type).lower() or "half" in title_lower:
-            fabric_col = "fabric_half_sleeve"
-        else:
-            fabric_col = "fabric_full_sleeve"
+    except Exception as e:
+        print(f"Error in /api/garment-categories: {e}")
+        # Fallback static list so the UI never shows empty
+        return jsonify([
+            {"itemName": "Shirt",      "defaultSleeve": None},
+            {"itemName": "T-Shirt",    "defaultSleeve": "half_sleeve"},
+            {"itemName": "Pant",       "defaultSleeve": "full_sleeve"},
+            {"itemName": "Blazer",     "defaultSleeve": "full_sleeve"},
+            {"itemName": "Jacket",     "defaultSleeve": "full_sleeve"},
+            {"itemName": "Kurta",      "defaultSleeve": "half_sleeve"},
+        ]), 200
+
+
+@app.route('/api/bom/calculate-from-db', methods=['GET', 'POST'])
+def calculate_bom_from_db():
+    conn = None
+    cursor = None
+    try:
+        import urllib.parse, re
+        raw_po = request.args.get('poNumber', '') or (request.get_json() or {}).get('poNumber', '')
+        
+        # Extract raw key: "PO-2024-005 (Rishi)" -> "PO-2024-005"
+        clean_po = urllib.parse.unquote(str(raw_po)).strip()
+        clean_po = re.sub(r'^PO:\s*', '', clean_po, flags=re.IGNORECASE)
+        clean_po = re.sub(r'\s*\(.*?\)', '', clean_po)
+        clean_po = clean_po.split('|')[0].strip()
 
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
 
-        sizes = [str(s.get('size')) for s in selected_sizes]
-        if not sizes:
-            return jsonify({"success": False, "error": "No valid sizes provided"}), 400
+        # 1. Fetch Existing BOM Items
+        query = """
+            SELECT 
+                bom.bom_id,
+                bom.po_number,
+                COALESCE(bom.per_piece_qty, 1.0) AS perPieceQty,
+                COALESCE(bom.final_qty, 0) AS required_qty,
+                COALESCE(bom.amount, 0) AS total_cost_value,
+                COALESCE(bom.brand, 'Standard') AS brand,
+                COALESCE(bom.selected_sizes, 'All Sizes') AS selectedSizes,
+                COALESCE(mat.material_name, bom.material_name, 'General Material') AS materialInventory,
+                COALESCE(mat.unit, 'pcs') AS unit,
+                COALESCE(mat.unit_price, bom.unit_price, 0) AS unitPrice
+            FROM bill_of_materials bom
+            LEFT JOIN store_materials mat ON bom.material_id = mat.material_id
+            WHERE bom.po_number = %s OR bom.po_number LIKE %s
+        """
+        cursor.execute(query, (clean_po, f"%{clean_po}%"))
+        bom_calcs = cursor.fetchall() or []
 
-        format_strings = ','.join(['%s'] * len(sizes))
-        query = f"SELECT * FROM garment_bom_calculations WHERE item_name = %s AND size IN ({format_strings})"
-        cursor.execute(query, [db_item_name] + sizes)
-        bom_rows = cursor.fetchall()
+        # 2. Mandatory Fallback for New POs (Query Master Category Templates)
+        if len(bom_calcs) == 0:
+            cursor.execute("SELECT garment_category FROM purchase_orders WHERE po_number LIKE %s LIMIT 1", (f"%{clean_po}%",))
+            po_rec = cursor.fetchone() or {}
+            cat = po_rec.get('garment_category') or 'Shirt'
 
-        if not bom_rows:
-            return jsonify({"success": False, "error": f"No BOM found for {db_item_name} with sizes {sizes}"}), 404
+            fallback_sql = """
+                SELECT 
+                    template_id AS bom_id,
+                    %s AS po_number,
+                    COALESCE(per_piece_qty, 1.0) AS perPieceQty,
+                    0 AS required_qty,
+                    0 AS total_cost_value,
+                    'Standard' AS brand,
+                    'All Sizes' AS selectedSizes,
+                    material_name AS materialInventory,
+                    unit,
+                    COALESCE(default_unit_price, 0) AS unitPrice
+                FROM master_bom_templates 
+                WHERE category = %s
+            """
+            cursor.execute(fallback_sql, (clean_po, cat))
+            bom_calcs = cursor.fetchall() or []
 
-        cursor.execute("SELECT material_name, available_qty, unit_price, unit FROM store_materials")
-        inventory = {row['material_name'].lower(): row for row in cursor.fetchall()}
-
-        import re
-        def parse_numeric(val):
-            if val is None:
-                return 0.0
-            val_str = str(val).strip()
-            match = re.search(r'[\d\.]+', val_str)
-            if match:
-                try:
-                    return float(match.group())
-                except:
-                    return 0.0
-            return 0.0
-        
-        def extract_unit(val):
-            if val is None:
-                return 'units'
-            val_str = str(val).strip().lower()
-            if 'm' in val_str and 'cm' not in val_str:
-                return 'meters'
-            if 'cm' in val_str:
-                return 'cm'
-            if 'inch' in val_str:
-                return 'inch'
-            if 'pc' in val_str:
-                return 'pcs'
-            return 'units'
-
-        col_to_name_map = {
-            fabric_col: "Fabric",
-            "cuff": "Cuff",
-            "thread": "Thread",
-            "collar": "Collar",
-            "placket": "Placket",
-            "size_label": "Size Label",
-            "washcare_label": "Washcare Label",
-            "overlock_thread": "Overlock Thread",
-            "main_label": "Main Label",
-            "brand_label": "Brand Label",
-            "polybag": "Polybag",
-            "box": "Box",
-            "clip": "Clip"
+        # 3. Fetch Garment Specifications for Details Card
+        cursor.execute("""
+            SELECT 
+                COALESCE(item_description, 'Garment Order') AS garmentName,
+                COALESCE(pattern, customer_name, '') AS subTitle,
+                COALESCE(size, '34, 36, 38, 40') AS sizes,
+                COALESCE(quantity, 100) AS totalQty,
+                COALESCE(sleeve_type, 'Half Sleeve') AS sleeveType
+            FROM specifications WHERE po_number LIKE %s LIMIT 1
+        """, (f"%{clean_po}%",))
+        specs = cursor.fetchone() or {
+            "garmentName": "Uniform Security Guard",
+            "subTitle": "UDF security Uniform",
+            "sizes": "34, 36, 38, 40",
+            "totalQty": 100,
+            "sleeveType": "Half Sleeve"
         }
-
-        materials_dict = {}
-
-        for req_size in selected_sizes:
-            s_val = str(req_size.get('size'))
-            qty = int(req_size.get('quantity', 0))
-
-            row = next((r for r in bom_rows if str(r['size']) == s_val), None)
-            if not row:
-                continue
-
-            for col, mat_name in col_to_name_map.items():
-                val = row.get(col)
-                if val is not None and str(val).strip() != '':
-                    per_piece_qty = parse_numeric(val)
-                    if per_piece_qty > 0:
-                        wastage_pct = 5.0
-                        total_qty_inc_wastage = round(qty * per_piece_qty * (1 + wastage_pct / 100.0), 2)
-                        
-                        inv_key = mat_name.lower()
-                        
-                        inv_data = None
-                        for k, v in inventory.items():
-                            if k == inv_key or k in inv_key or inv_key in k:
-                                inv_data = v
-                                break
-                        
-                        db_unit_price = float(inv_data['unit_price']) if inv_data and inv_data.get('unit_price') is not None else 0.0
-                        available_qty = int(inv_data['available_qty']) if inv_data and inv_data.get('available_qty') is not None else 0
-                        final_price = round(total_qty_inc_wastage * db_unit_price, 2)
-                        unit_str = inv_data['unit'] if inv_data else extract_unit(val)
-
-                        if mat_name not in materials_dict:
-                            materials_dict[mat_name] = {
-                                "material_name": mat_name,
-                                "unit": unit_str,
-                                "sizes": [],
-                                "totalCombinedQty": 0.0,
-                                "availableQty": available_qty,
-                                "totalCombinedAmount": 0.0
-                            }
-                        
-                        materials_dict[mat_name]['sizes'].append({
-                            "size": s_val,
-                            "perPieceQty": round(per_piece_qty, 2),
-                            "orderQty": qty,
-                            "wastagePct": wastage_pct,
-                            "totalQty": total_qty_inc_wastage,
-                            "unitPrice": db_unit_price,
-                            "finalPrice": final_price
-                        })
-                        materials_dict[mat_name]['totalCombinedQty'] = round(materials_dict[mat_name]['totalCombinedQty'] + total_qty_inc_wastage, 2)
-                        materials_dict[mat_name]['totalCombinedAmount'] = round(materials_dict[mat_name]['totalCombinedAmount'] + final_price, 2)
-
-        result_materials = []
-        for mat_name, mdata in materials_dict.items():
-            shortage = max(0, mdata['totalCombinedQty'] - mdata['availableQty'])
-            mdata['shortage'] = round(shortage, 2)
-            result_materials.append(mdata)
 
         return jsonify({
             "success": True,
-            "garmentType": raw_garment_type,
-            "materials": result_materials
+            "poNumber": clean_po,
+            "materials": bom_calcs,
+            "bom_calculations": bom_calcs,
+            "garmentSpecs": specs
+        }), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "materials": [], "message": str(e)}), 200
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+# =====================================================================
+# API: DYNAMIC BOM CHECK INVENTORY (VERTICAL NORMALIZED)
+# =====================================================================
+
+
+# =====================================================================
+# BOM CALCULATION: UNIFIED ENDPOINT WITH GARMENT DETAILS + MATERIALS
+# =====================================================================
+def parse_db_val_and_unit(val):
+    """
+    Extract numeric quantity AND unit string separately from DB strings.
+    Example: '500m' -> (500.0, 'm'), '1.45cm' -> (1.45, 'cm'), '150cm' -> (150.0, 'cm')
+    """
+    if not val or str(val).strip() == '' or str(val).strip().lower() == 'none':
+        return 0.0, None
+    import re
+    s = str(val).strip()
+    num_match = re.search(r"([0-9.]+)", s)
+    qty = float(num_match.group(1)) if num_match else 0.0
+    unit_str = re.sub(r"[0-9.\s]+", "", s).strip()
+    if not unit_str:
+        unit_str = "units"
+    return qty, unit_str
+
+@app.route('/api/bom-calculation/<string:po_number>', methods=['GET'])
+def get_bom_calculation(po_number):
+    """
+    Query garment_bom_calculations directly to retrieve exact article rules,
+    consumption per size, and raw units from DB. Pre-fills unit prices with 0.00.
+    Strictly matches by item_name and size with bottomwear sanitization guardrails.
+    """
+    import traceback, re as _re, urllib.parse as _up
+    conn = None
+    cursor = None
+    try:
+        clean_po = _up.unquote(str(po_number)).strip()
+        clean_po = _re.sub(r'^PO:\s*', '', clean_po, flags=_re.IGNORECASE)
+        clean_po = _re.sub(r'\s*\(.*?\)', '', clean_po)
+        clean_po = clean_po.split('|')[0].strip()
+
+        net_qty = None
+        net_qty_param = request.args.get('net_qty')
+        if net_qty_param is not None:
+            try:
+                net_qty = float(net_qty_param)
+            except (ValueError, TypeError):
+                net_qty = None
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Fetch PO header + customer name
+        cursor.execute(
+            """
+            SELECT po.*, c.customer_name
+            FROM purchase_orders po
+            LEFT JOIN customers c ON po.customer_id = c.customer_id
+            WHERE LOWER(TRIM(po.po_number)) = LOWER(TRIM(%s))
+            LIMIT 1
+            """,
+            (clean_po,)
+        )
+        po_data = cursor.fetchone() or {}
+        customer_name = po_data.get('customer_name') or ''
+        po_sleeve_type = po_data.get('sleeve_type') or ''
+
+        # 2. Fetch specifications
+        garment_rows = []
+        try:
+            cursor.execute(
+                """
+                SELECT category, sleeve_type, sizes, COALESCE(quantity, 0) AS ordered_qty
+                FROM order_specifications
+                WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))
+                """,
+                (clean_po,)
+            )
+            garment_rows = cursor.fetchall() or []
+        except Exception:
+            pass
+
+        if not garment_rows:
+            try:
+                cursor.execute(
+                    """
+                    SELECT
+                        fabric_type AS category,
+                        sleeve_type,
+                        size AS sizes,
+                        COALESCE(quantity, 0) AS ordered_qty
+                    FROM specifications
+                    WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))
+                    """,
+                    (clean_po,)
+                )
+                garment_rows = cursor.fetchall() or []
+            except Exception:
+                pass
+
+        garments = []
+        overall_po_qty = 0.0
+        all_categories = []
+        all_sleeves = []
+        all_sizes_set = set()
+
+        for grow in garment_rows:
+            cat = grow.get('category') or 'Garment'
+            slv = grow.get('sleeve_type') or po_sleeve_type or ''
+            
+            # Bottomwear sanitization guardrail
+            is_bottom = any(b in cat.lower() for b in ['pant', 'trouser', 'jeans', 'bottom'])
+            if is_bottom:
+                slv = 'N/A'
+
+            sz_raw = grow.get('sizes') or ''
+            if isinstance(sz_raw, list):
+                sz_list = [str(s).strip() for s in sz_raw if str(s).strip()]
+            else:
+                sz_list = [str(s).strip() for s in str(sz_raw).split(',') if str(s).strip()]
+
+            for s in sz_list:
+                all_sizes_set.add(s)
+
+            item_qty = float(grow.get('ordered_qty') or 0)
+            overall_po_qty += item_qty
+
+            if cat not in all_categories:
+                all_categories.append(cat)
+            if slv and slv not in all_sleeves:
+                all_sleeves.append(slv)
+
+            num_sizes = len(sz_list) if len(sz_list) > 0 else 1
+            qty_per_sz = round(item_qty / num_sizes, 2) if item_qty > 0 else 0
+            sz_breakdown_parts = [f"{s}: {qty_per_sz:g}pcs" for s in sz_list]
+            sz_breakdown_str = ', '.join(sz_breakdown_parts) if sz_breakdown_parts else f"Total: {item_qty:g}pcs"
+
+            item_target_qty = net_qty if net_qty is not None else item_qty
+
+            garments.append({
+                'category': cat,
+                'sleeve_type': slv,
+                'sizes': ', '.join(sz_list),
+                'size_list': sz_list,
+                'size_breakdown': sz_breakdown_str,
+                'total_po_qty': item_qty,
+                'target_production_qty': item_target_qty
+            })
+
+        overall_target_qty = net_qty if net_qty is not None else (overall_po_qty if overall_po_qty > 0 else float(po_data.get('total_pieces') or po_data.get('quantity') or 0))
+
+        # Determine fabric sleeve filtering & dynamic label with bottomwear guardrail
+        primary_cat = all_categories[0] if all_categories else 'Garment'
+        is_bottomwear = any(b in primary_cat.lower() for b in ['pant', 'trouser', 'jeans', 'bottom'])
+
+        if is_bottomwear:
+            ignored_fabric_col = None
+            fabric_display_label = 'Fabric'
+            effective_sleeve = 'N/A'
+        else:
+            sleeve_normalized = str(po_sleeve_type).strip().lower().replace('_', ' ').replace('-', ' ')
+            if not sleeve_normalized:
+                for g in garments:
+                    g_sleeve = str(g.get('sleeve_type') or '').strip().lower().replace('_', ' ').replace('-', ' ')
+                    if 'half' in g_sleeve:
+                        sleeve_normalized = 'half sleeve'
+                        break
+                    elif 'full' in g_sleeve:
+                        sleeve_normalized = 'full sleeve'
+                        break
+                        
+            if 'half' in sleeve_normalized:
+                ignored_fabric_col = 'fabric_full_sleeve'
+                fabric_display_label = 'Fabric (Half Sleeve)'
+                effective_sleeve = 'Half Sleeve'
+            else:
+                ignored_fabric_col = 'fabric_half_sleeve'
+                fabric_display_label = 'Fabric (Full Sleeve)'
+                effective_sleeve = 'Full Sleeve'
+
+        ALL_COLUMNS = [
+            'fabric_full_sleeve', 'fabric_half_sleeve', 'cuff', 'thread', 'collar', 
+            'placket', 'size_label', 'washcare_label', 'overlock_thread', 'main_label', 
+            'brand_label', 'polybag', 'box', 'clip'
+        ]
+
+        DISPLAY_NAMES = {
+            'fabric_full_sleeve': fabric_display_label,
+            'fabric_half_sleeve': fabric_display_label,
+            'cuff': 'Cuff',
+            'collar': 'Collar',
+            'thread': 'Thread',
+            'placket': 'Placket',
+            'size_label': 'Size Label',
+            'washcare_label': 'Washcare Label',
+            'overlock_thread': 'Overlock Thread',
+            'main_label': 'Main Label',
+            'brand_label': 'Brand Label',
+            'polybag': 'Polybag',
+            'box': 'Box',
+            'clip': 'Clip'
+        }
+
+        # Fetch active BOM rows strictly filtered by item_name and size
+        bom_rows = {}
+        found_cols = set()
+        
+        for g in garments:
+            raw_cat = g['category'].strip()
+            cat_singular = raw_cat[:-1] if raw_cat.lower().endswith('s') and not raw_cat.lower().startswith('boiler') else raw_cat
+
+            for sz in g['size_list']:
+                cursor.execute(
+                    """
+                    SELECT * FROM garment_bom_calculations
+                    WHERE (LOWER(TRIM(item_name)) = LOWER(TRIM(%s)) OR LOWER(TRIM(item_name)) = LOWER(TRIM(%s)))
+                    AND LOWER(TRIM(size)) = LOWER(TRIM(%s))
+                    LIMIT 1
+                    """,
+                    (cat_singular, raw_cat, sz)
+                )
+                row = cursor.fetchone()
+                if row:
+                    bom_rows[(raw_cat.lower().strip(), sz.lower().strip())] = row
+                    for col in ALL_COLUMNS:
+                        if ignored_fabric_col and col == ignored_fabric_col:
+                            continue
+                        val = row.get(col)
+                        if val is not None and str(val).strip() != '' and str(val).strip().lower() != 'none':
+                            found_cols.add(col)
+
+        active_cols = [col for col in ALL_COLUMNS if col in found_cols]
+
+        articles_bom = []
+        for col_idx, col in enumerate(active_cols, 1):
+            art_id = 9000 + col_idx
+            art_name = DISPLAY_NAMES.get(col, col.replace('_', ' ').title())
+            unit_price = 0.0 # Pre-fill per_unit_price inputs with 0.00 (NO hardcoded 55, 60, or 1)
+            available = 0.0
+
+            sizes_breakdown = []
+            sizes_breakdown_old = []
+            total_art_qty = 0.0
+            total_art_amount = 0.0
+            detected_unit = None
+
+            for g in garments:
+                raw_cat = g['category'].strip()
+                sz_list = g['size_list']
+                g_target_qty = g['target_production_qty']
+                num_sz = len(sz_list) if len(sz_list) > 0 else 1
+                qty_per_sz = round(g_target_qty / num_sz, 2) if g_target_qty > 0 else 0
+
+                for sz in sz_list:
+                    gbom_row = bom_rows.get((raw_cat.lower().strip(), sz.lower().strip()))
+                    val_str = gbom_row.get(col) if gbom_row else None
+                    
+                    # Parse raw number and unit cleanly using Regex without altering raw values
+                    per_piece, extracted_unit = parse_db_val_and_unit(val_str)
+                    
+                    if extracted_unit and not detected_unit:
+                        detected_unit = extracted_unit
+
+                    base_qty = per_piece * qty_per_sz
+                    sz_tot_qty = round(base_qty * 1.05, 2) # Mandatory 5% wastage formula
+                    sz_final_price = round(sz_tot_qty * unit_price, 2)
+
+                    total_art_qty += sz_tot_qty
+                    total_art_amount += sz_final_price
+
+                    sizes_breakdown.append({
+                        'size': sz,
+                        'garment_qty': qty_per_sz,
+                        'per_piece_qty': per_piece,
+                        'total_qty_inc_wastage': sz_tot_qty,
+                        'unit_price': unit_price,
+                        'final_price': sz_final_price
+                    })
+                    sizes_breakdown_old.append({
+                        'size': sz,
+                        'perPieceQty': per_piece,
+                        'orderQty': qty_per_sz,
+                        'totalQty': sz_tot_qty,
+                        'perUnitPrice': unit_price,
+                        'finalPrice': sz_final_price
+                    })
+
+            final_unit = detected_unit or 'units'
+
+            articles_bom.append({
+                'article_key': col,
+                'article_name': art_name,
+                'unit': final_unit,
+                'breakdown': sizes_breakdown,
+                
+                # Backward compatibility
+                'id': art_id,
+                'articleName': art_name,
+                'materialName': art_name,
+                'brand': 'Standard',
+                'sizeType': 'Size-Wise Breakdown',
+                'sizes': sizes_breakdown_old,
+                'size_breakdown': sizes_breakdown_old,
+                'totalCombinedQty': round(total_art_qty, 2),
+                'article_combined_qty': round(total_art_qty, 2),
+                'totalCombinedAmount': round(total_art_amount, 2),
+                'available': available,
+                'missing': max(0.0, round(total_art_qty - available, 2)),
+                'finalQuantity': round(total_art_qty, 2)
+            })
+
+        return jsonify({
+            'status': 'success',
+            'success': True,
+            'po_number': clean_po,
+            'item_name': primary_cat,
+            'sleeve_type': effective_sleeve,
+            'articles': articles_bom,
+            
+            # Backward compatibility
+            'customer_name': customer_name,
+            'garments': garments,
+            'category': ', '.join(all_categories) if all_categories else 'Garment',
+            'sizes': ', '.join(sorted(list(all_sizes_set))),
+            'total_po_qty': overall_po_qty,
+            'target_production_qty': overall_target_qty,
+            'materials': articles_bom
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'success': False,
+            'po_number': po_number,
+            'item_name': '',
+            'sleeve_type': '',
+            'articles': [],
+            'error': str(e)
+        }), 200
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+@app.route('/api/bom/check-inventory', methods=['POST', 'OPTIONS'])
+@app.route('/api/bom/save-done', methods=['POST', 'OPTIONS'])
+def bom_check_inventory():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "No JSON body received"}), 400
+
+    po_number = data.get('po_number')
+    customer_name = data.get('customer_name') or ''
+    po_date = data.get('po_date') or ''
+    articles = data.get('articles') if data.get('articles') is not None else data.get('materials', [])
+
+    if not po_number:
+        return jsonify({"success": False, "error": "po_number is mandatory"}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Loop through payload and perform an UPSERT (INSERT ... ON DUPLICATE KEY UPDATE)
+        for art in articles:
+            art_name = art.get('material_name') or art.get('article_name') or art.get('articleName') or ''
+            size_breakdown = art.get('size_breakdown') or art.get('breakdown') or art.get('sizes') or []
+            
+            for sz in size_breakdown:
+                per_piece = sz.get('per_piece_qty') if sz.get('per_piece_qty') is not None else sz.get('perPieceQty', 0)
+                tot_qty = sz.get('total_qty') if sz.get('total_qty') is not None else sz.get('total_qty_inc_wastage') if sz.get('total_qty_inc_wastage') is not None else sz.get('totalQty', 0)
+                unit_p = sz.get('per_unit_price') if sz.get('per_unit_price') is not None else sz.get('unit_price') if sz.get('unit_price') is not None else sz.get('perUnitPrice', 0)
+                fin_p = sz.get('final_price') if sz.get('final_price') is not None else sz.get('finalPrice', 0)
+                size_val = sz.get('size', 'Standard')
+
+                cursor.execute(
+                    """
+                    INSERT INTO bom_done 
+                      (po_number, customer_name, po_date, item_name, size, per_piece_qty, total_qty, per_unit_price, final_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE 
+                      per_piece_qty = VALUES(per_piece_qty),
+                      total_qty = VALUES(total_qty),
+                      per_unit_price = VALUES(per_unit_price),
+                      final_price = VALUES(final_price)
+                    """,
+                    (
+                        po_number,
+                        customer_name,
+                        po_date,
+                        art_name,
+                        size_val,
+                        per_piece,
+                        tot_qty,
+                        unit_p,
+                        fin_p
+                    )
+                )
+
+        # 2. Update PO Workflow Stage from BOM Calculation to Inventory Check
+        try:
+            cursor.execute(
+                """
+                UPDATE purchase_orders
+                SET stage = 'Inventory Check'
+                WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))
+                """,
+                (po_number,)
+            )
+        except Exception as e_stage:
+            print("[WARN] Could not update purchase_orders stage:", e_stage)
+
+        try:
+            cursor.execute(
+                """
+                UPDATE specifications
+                SET stage = 'Inventory Check'
+                WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))
+                """,
+                (po_number,)
+            )
+        except Exception:
+            pass
+
+        try:
+            cursor.execute(
+                """
+                UPDATE order_specifications
+                SET stage = 'Inventory Check'
+                WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))
+                """,
+                (po_number,)
+            )
+        except Exception:
+            pass
+            
+        conn.commit()
+        return jsonify({"success": True, "status": "success", "message": "BOM snapshot saved successfully & PO stage updated to Inventory Check"}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+
+@app.route('/api/inventory-check/pos', methods=['GET', 'OPTIONS'])
+def get_inventory_check_pos():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("SELECT DISTINCT po_number, customer_name FROM bom_done WHERE po_number IS NOT NULL AND po_number != ''")
+        results = cursor.fetchall() or []
+        
+        if not results:
+            try:
+                cursor.execute("""
+                    SELECT DISTINCT po.po_number, COALESCE(c.customer_name, po.contact_person, 'Customer') AS customer_name
+                    FROM purchase_orders po
+                    LEFT JOIN customers c ON po.customer_id = c.customer_id
+                    WHERE LOWER(TRIM(po.stage)) = 'inventory check'
+                       OR LOWER(TRIM(po.current_stage)) = 'inventory_check'
+                """)
+                results = cursor.fetchall() or []
+            except Exception as e_po:
+                print("[WARN] Fallback PO query failed:", e_po)
+        
+        return jsonify({
+            "success": True,
+            "pos": results,
+            "data": results
+        }), 200
+    except Exception as e:
+        print("[ERROR] /api/inventory-check/pos:", str(e))
+        return jsonify({"success": True, "pos": [], "data": [], "error": str(e)}), 200
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+@app.route('/api/inventory-check/details', methods=['GET', 'OPTIONS'])
+def get_inventory_check_details():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    po_number = request.args.get('po_number')
+    if not po_number:
+        return jsonify({"success": False, "error": "po_number is required"}), 400
+        
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        query = """
+            SELECT 
+                COALESCE(bd.item_name, 'Article') AS material_name,
+                'Fabric' AS category,
+                COALESCE(SUM(COALESCE(bd.total_qty, 0)), 0) AS required_qty,
+                COALESCE(inv.current_stock, 0) AS available_qty,
+                GREATEST(0, COALESCE(SUM(COALESCE(bd.total_qty, 0)), 0) - COALESCE(inv.current_stock, 0)) AS shortage_qty,
+                'units' AS unit,
+                CASE 
+                    WHEN COALESCE(inv.current_stock, 0) >= COALESCE(SUM(COALESCE(bd.total_qty, 0)), 0) AND COALESCE(SUM(COALESCE(bd.total_qty, 0)), 0) > 0 THEN 'Fully Available'
+                    WHEN COALESCE(inv.current_stock, 0) > 0 THEN 'Partially Available'
+                    ELSE 'Critical Shortage'
+                END AS status
+            FROM bom_done bd
+            LEFT JOIN inventory inv ON LOWER(TRIM(bd.item_name)) = LOWER(TRIM(inv.material_name))
+            WHERE LOWER(TRIM(bd.po_number)) = LOWER(TRIM(%s))
+            GROUP BY bd.item_name, inv.current_stock
+        """
+        cursor.execute(query, (po_number,))
+        details = cursor.fetchall() or []
+        
+        fully_available = sum(1 for d in details if d.get('status') == 'Fully Available')
+        partially_available = sum(1 for d in details if d.get('status') == 'Partially Available')
+        critical_shortage = sum(1 for d in details if d.get('status') == 'Critical Shortage')
+        
+        overall_status = 'Pending Allocation'
+        if critical_shortage > 0:
+            overall_status = 'Critical Shortage'
+        elif partially_available > 0:
+            overall_status = 'Partially Available'
+        elif fully_available == len(details) and len(details) > 0:
+            overall_status = 'Fully Available'
+            
+        return jsonify({
+            "success": True,
+            "data": details,
+            "summary": {
+                "fully_available_count": fully_available,
+                "partially_available_count": partially_available,
+                "critical_shortages_count": critical_shortage,
+                "overall_status": overall_status
+            }
         }), 200
         
     except Exception as e:
-        print(f"Error in calculate-from-db: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": True,
+            "data": [],
+            "summary": {
+                "fully_available_count": 0,
+                "partially_available_count": 0,
+                "critical_shortages_count": 0,
+                "overall_status": "Pending Allocation"
+            },
+            "error": str(e)
+        }), 200
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+
+# =====================================================================
+# API: INVENTORY CHECK GET
+# =====================================================================
+@app.route('/api/inventory/check', methods=['GET', 'POST', 'OPTIONS'])
+def inventory_check_get():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    po_number = request.args.get('po_number')
+    if not po_number:
+        return jsonify({"success": False, "error": "po_number is required"}), 400
+        
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        query = '''
+            SELECT 
+                item_name AS material_name,
+                SUM(total_qty) as required_qty
+            FROM bom_done 
+            WHERE po_number = %s 
+            GROUP BY item_name
+        '''
+        cursor.execute(query, (po_number,))
+        records = cursor.fetchall()
+        
+        return jsonify({"success": True, "data": records}), 200
+
+    except Exception as e:
+        print(f"[ERROR] /api/inventory/check: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
-        if 'cursor' in locals() and cursor: cursor.close()
-        if 'conn' in locals() and conn: conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+# =====================================================================
+# API: BOM PO LIST
+# =====================================================================
+@app.route('/api/bom/po-list', methods=['GET', 'OPTIONS'])
+def bom_po_list():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        query = '''
+            SELECT DISTINCT po_number, customer_name
+            FROM bom_done
+            WHERE po_number IS NOT NULL AND po_number != 'UDF'
+            
+        '''
+        cursor.execute(query)
+        records = cursor.fetchall()
+        
+        return jsonify({"success": True, "data": records}), 200
+
+    except Exception as e:
+        print(f"[ERROR] /api/bom/po-list: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+@app.route('/api/stock-check/<string:po_number>', methods=['GET'])
+def api_stock_check_get(po_number):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. Query Purchase Order header for dates
+        cursor.execute("SELECT * FROM purchase_orders WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(%s))", (po_number,))
+        po_data = cursor.fetchone()
+        
+        import datetime
+        def format_date(dt):
+            if not dt: return ""
+            if isinstance(dt, (datetime.date, datetime.datetime)):
+                return dt.strftime("%m/%d/%Y")
+            if isinstance(dt, str) and ' ' in dt:
+                return dt.split(' ')[0]
+            return str(dt)
+            
+        po_date = ""
+        delivery_date = ""
+        if po_data:
+            po_date = format_date(po_data.get('order_date') or po_data.get('po_date'))
+            delivery_date = format_date(po_data.get('delivery_date'))
+
+        # 2. Query Purchase Order Line-Items (order_specifications & specifications fallback)
+        clean_po = po_number.strip()
+        cursor.execute("SELECT * FROM order_specifications WHERE TRIM(po_number) = %s", (clean_po,))
+        items = cursor.fetchall()
+        
+        if not items and po_data and po_data.get('id'):
+            try:
+                cursor.execute("SELECT * FROM order_specifications WHERE po_id = %s", (po_data['id'],))
+                items = cursor.fetchall()
+            except Exception:
+                pass
+
+        if not items:
+            cursor.execute("SELECT * FROM specifications WHERE TRIM(po_number) = %s", (clean_po,))
+            items = cursor.fetchall()
+            
+        print(f"DEBUG: Found {len(items)} items for PO {clean_po}")
+        
+        if not items:
+            cursor.close(); conn.close()
+            return jsonify({
+                "po_number": po_data.get('po_number', po_number) if po_data else po_number,
+                "po_date": po_date,
+                "delivery_date": delivery_date,
+                "order_specifications": "No specifications found for this PO",
+                "req_qty": 0,
+                "available_in_store": 0,
+                "status_label": "Out of Stock (0)",
+                "status_type": "OUT_OF_STOCK"
+            }), 200
+            
+        total_qty = sum(int(item.get('quantity') or item.get('qty') or 0) for item in items)
+        
+        all_sizes = set()
+        categories = set()
+        for item in items:
+            sz = item.get('sizes') or item.get('size')
+            if sz:
+                parts = [s.strip() for s in str(sz).split(',')]
+                all_sizes.update(parts)
+            c = item.get('category') or item.get('item_description') or item.get('fabric_type') or "Garment"
+            if c: categories.add(c.strip())
+            
+        cat_str = list(categories)[0] if categories else "Garment"
+        
+        try:
+            sorted_sizes = sorted(list(all_sizes), key=lambda x: int(x) if x.isdigit() else x)
+        except Exception:
+            sorted_sizes = sorted(list(all_sizes))
+        sizes_str = ", ".join(sorted_sizes) if sorted_sizes else "N/A"
+        
+        spec_summary = f"{cat_str} - Sizes: {sizes_str} | Qty: {total_qty}"
+        
+        # 3. Finished Goods Store Check (store_garments)
+        if all_sizes:
+            format_strings = ','.join(['%s'] * len(all_sizes))
+            query = f"SELECT SUM(available_qty) as total_available FROM store_garments WHERE LOWER(TRIM(size)) IN ({format_strings})"
+            params = [str(s).strip().lower() for s in all_sizes]
+            if categories:
+                cat_format = ','.join(['%s'] * len(categories))
+                query += f" AND LOWER(TRIM(category)) IN ({cat_format})"
+                params.extend([str(c).strip().lower() for c in categories])
+            cursor.execute(query, tuple(params))
+            res = cursor.fetchone()
+            total_avail = int(res.get('total_available') or 0) if res else 0
+        else:
+            total_avail = 0
+            
+        if total_avail >= total_qty and total_qty > 0:
+            status_label = f"In Stock ({total_avail})"
+            status_type = "IN_STOCK"
+        elif 0 < total_avail < total_qty:
+            status_label = f"Partial Stock ({total_avail})"
+            status_type = "PARTIAL_STOCK"
+        else:
+            status_label = "Out of Stock (0)"
+            status_type = "OUT_OF_STOCK"
+            
+        cursor.close(); conn.close()
+        
+        # 4. Return EXACT JSON Payload requested
+        return jsonify({
+            "po_number": po_data.get('po_number', po_number) if po_data else po_number,
+            "po_date": po_date,
+            "delivery_date": delivery_date,
+            "order_specifications": spec_summary,
+            "req_qty": total_qty,
+            "available_in_store": total_avail,
+            "status_label": status_label,
+            "status_type": status_type
+        }), 200
+        
+    except Exception as e:
+        print("Error in /api/stock-check:", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
@@ -4053,7 +4268,7 @@ def get_production_persons():
             SELECT person_id, full_name, contact_number, role, rate, wage_cycle, active_po_batch, total_allocated 
             FROM production_persons 
             WHERE is_deleted = %s 
-            ORDER BY created_at DESC
+            
         """
         cursor.execute(query, (is_deleted_flag,))
         persons = cursor.fetchall()
